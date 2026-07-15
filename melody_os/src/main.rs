@@ -3,6 +3,7 @@
 
 use core::panic::PanicInfo;
 use core::arch::global_asm;
+use core::fmt;
 
 // prevents crashing
 global_asm!(
@@ -20,6 +21,8 @@ global_asm!(
     "b rust_main"
 );
 
+struct Dummy;
+
 // hardware addresses
 const MMIO_BASE: u32 = 0x3F00_0000;
 const UART0_DR: *mut u32 = (MMIO_BASE + 0x0020_1000) as *mut u32;
@@ -34,26 +37,50 @@ fn putc(c: u8) {
     }
 }
 
-fn puts(s: &str) {
-    for byte in s.bytes() {
-        if byte == b'\n' {
-            putc(b'\r');
+impl fmt::Write for Dummy {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            if byte == b'\n' { 
+                putc(b'\r'); 
+            }
+            putc(byte);
         }
-        putc(byte);
+        Ok(())
     }
+}
+
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) 
+{
+    use core::fmt::Write;
+    Dummy.write_fmt(args).unwrap();
+}
+
+// macros
+#[macro_export]
+macro_rules! print 
+{
+    ($($arg:tt)*) => ($crate::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! println 
+{
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main() -> ! {
-    puts("\n==================================\n");
-    puts(" Hello World from Melody OS! \n");
-    puts("==================================\n");
-
+    println!("\n==================================");
+    println!(" Hello World from Melody OS!");
+    println!("==================================\n");
     loop {}
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    puts("\n[!] KERNEL PANIC!\n");
+fn panic(info: &PanicInfo) -> ! {
+    println!("\n[!] KERNEL PANIC!");
+    println!("{}", info);
     loop {}
 }
