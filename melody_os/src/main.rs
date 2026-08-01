@@ -9,12 +9,20 @@ mod vga_buffer;
 use core::panic::PanicInfo;
 
 #[cfg(test)]
-pub fn test_runner(_tests: &[&dyn Fn()]) {}
+pub fn test_runner(tests: &[&dyn Fn()]) {
+    println!("Running {} tests", tests.len());
+    for test in tests {
+        test();
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     println!("wow using macro{}", "!");
-    panic!("oh no");
+
+    #[cfg(test)]
+    test_main();
+
     loop {}
 }
 
