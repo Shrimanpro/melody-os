@@ -1,6 +1,7 @@
 #![no_std]
 #![cfg_attr(test, no_main)]
 #![feature(custom_test_frameworks)]
+#![feature(abi_x86_interrupt)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
@@ -47,13 +48,11 @@ pub enum QemuExitCode {
 }
 
 pub fn exit_qemu(exit_code: QemuExitCode) {
+    use x86_64::instructions::port::Port;
+
     unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") 0xf4u16,
-            in("eax") exit_code as u32,
-            options(nomem, nostack, preserves_flags)
-        );
+        let mut port = Port::new(0xf4);
+        port.write(exit_code as u32);
     }
 }
 
