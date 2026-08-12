@@ -3,6 +3,10 @@ name = "melody_os"
 version = "0.1.0"
 edition = "2024"
 
+[[test]]
+name = "should_panic"
+harness = false
+
 [dependencies]
 # updating bootloder from 0.9.23 to latest
 # because it new nightly broke everything
