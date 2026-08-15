@@ -7,6 +7,10 @@ edition = "2024"
 name = "should_panic"
 harness = false
 
+[[test]]
+name = "stack_overflow"
+harness = false
+
 [dependencies]
 # updating bootloder from 0.9.23 to latest
 # because it new nightly broke everything
