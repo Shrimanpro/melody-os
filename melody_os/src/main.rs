@@ -12,17 +12,19 @@ use core::panic::PanicInfo;
 pub extern "C" fn _start() -> ! {
     println!("wow using macro{}", "!");
 
+    melody_os::init();
+
     #[cfg(test)]
     test_main();
 
-    loop {}
+    melody_os::hlt_loop();
 }
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("{}", info);
-    loop {}
+    melody_os::hlt_loop();
 }
 
 #[cfg(test)]
