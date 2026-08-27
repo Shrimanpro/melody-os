@@ -14,7 +14,7 @@ harness = false
 [dependencies]
 # updating bootloder from 0.9.23 to latest
 # because it new nightly broke everything
-bootloader = "0.9.35"
+bootloader = { version = "0.9.35", features = ["map_physical_memory"] }
 volatile = "=0.2.6"
 spin = "0.5.2"
 x86_64 = "0.15.5"
