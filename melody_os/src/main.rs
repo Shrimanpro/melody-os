@@ -9,10 +9,7 @@ use core::panic::PanicInfo;
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! 
 {
-    use core::fmt::Write;
-    vga_buffer::WRITER.lock().write_str("testing").unwrap();
-    // write!(vga_buffer::WRITER.lock(), ", nums: {} {}", 42, 1.513).unwrap();
-
+    println!("wow using macro{}", "!");
     loop {}
 }
 
