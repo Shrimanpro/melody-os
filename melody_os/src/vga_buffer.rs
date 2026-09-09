@@ -20,6 +20,9 @@ pub enum Color {
     White = 15,
 }
 
+use volatile::Volatile;
+use core::fmt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 struct ColorCode(u8);
@@ -40,7 +43,6 @@ struct ScreenChar {
 const BUFFER_HEIGHT: usize = 25;
 const BUFFER_WIDTH: usize = 80;
 
-use volatile::Volatile;
 
 #[repr(transparent)]
 struct Buffer {
@@ -86,7 +88,17 @@ impl Writer {
     fn new_line(&mut self) {/* TODO */}
 }
 
+impl fmt::Write for Writer 
+{
+    fn write_str(&mut self, s: &str) -> fmt::Result
+    {
+        self.write_string(s);
+        Ok(())
+    }
+}
+
 pub fn print_something() {
+    use core::fmt::Write;
     let mut writer = Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::Yellow, Color::Black),
@@ -95,7 +107,7 @@ pub fn print_something() {
 
     writer.write_byte(b'S');
     writer.write_string(" Hello ");
-    writer.write_string("World!");
+    write!(writer, "The numbers are {} and {}", 42, 4.0/2.0).unwrap();
 }
 
 
