@@ -10,11 +10,13 @@ use core::panic::PanicInfo;
 pub extern "C" fn _start() -> ! 
 {
     println!("wow using macro{}", "!");
+    panic!("oh no");
     loop {}
 }
 
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    println!("{}", info);
     loop {}
 }
