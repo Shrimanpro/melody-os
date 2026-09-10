@@ -185,3 +185,56 @@ pub unsafe fn enable_bus_mastering(bus: u8, device: u8, function: u8) {
     let new_command = command | 0x0007;
     unsafe { pci_write_16(bus, device, function, 0x04, new_command) };
 }
+
+unsafe fn read_bar(bus: u8, device: u8, function: u8, bar_index: usize) -> (Bar, bool) {
+    let offset = 0x10 + (bar_index as u8) * 4;
+    let original = unsafe { pci_read_32(bus, device, function, offset) };
+    if original == 0 || original == 0xFFFFFFFF {
+        return (Bar::Empty, false);
+    }
+
+    if (original & 1) == 1 {
+        // I/O space BAR
+        let port = (original & !0x3) as u16;
+        (Bar::Io { port }, false)
+    } else {
+        // Memory space BAR
+        let bar_type = (original >> 1) & 0x3;
+        let prefetchable = ((original >> 3) & 1) == 1;
+
+        if bar_type == 0b10 {
+            // 64-bit BAR
+            let original_high = unsafe { pci_read_32(bus, device, function, offset + 4) };
+            let address = ((original_high as u64) << 32) | ((original & !0xF) as u64);
+
+            // Size determination
+            unsafe {
+                pci_write_32(bus, device, function, offset, 0xFFFFFFFF);
+                pci_write_32(bus, device, function, offset + 4, 0xFFFFFFFF);
+            }
+            let size_mask_low = unsafe { pci_read_32(bus, device, function, offset) };
+            let size_mask_high = unsafe { pci_read_32(bus, device, function, offset + 4) };
+            unsafe {
+                pci_write_32(bus, device, function, offset, original);
+                pci_write_32(bus, device, function, offset + 4, original_high);
+            }
+
+            let mask = ((size_mask_high as u64) << 32) | ((size_mask_low & !0xF) as u64);
+            let size = if mask != 0 { (!mask).wrapping_add(1) } else { 0 };
+
+            (Bar::Memory64 { address, size, prefetchable }, true)
+        } else {
+            // 32-bit BAR
+            let address = original & !0xF;
+
+            unsafe { pci_write_32(bus, device, function, offset, 0xFFFFFFFF) };
+            let size_mask = unsafe { pci_read_32(bus, device, function, offset) };
+            unsafe { pci_write_32(bus, device, function, offset, original) };
+
+            let mask = size_mask & !0xF;
+            let size = if mask != 0 { (!mask).wrapping_add(1) } else { 0 };
+
+            (Bar::Memory32 { address, size, prefetchable }, false)
+        }
+    }
+}
