@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::fmt;
 use x86_64::instructions::port::Port;
 
@@ -237,4 +238,63 @@ unsafe fn read_bar(bus: u8, device: u8, function: u8, bar_index: usize) -> (Bar,
             (Bar::Memory32 { address, size, prefetchable }, false)
         }
     }
+}
+
+pub fn scan_pci_bus() -> Vec<PciDevice> {
+    let mut devices = Vec::new();
+
+    for bus in 0..=255 {
+        for device in 0..32 {
+            let vendor_id = unsafe { pci_read_16(bus, device, 0, 0x00) };
+            if vendor_id == 0xFFFF {
+                continue;
+            }
+
+            let header_type = unsafe { pci_read_8(bus, device, 0, 0x0E) };
+            let max_functions = if (header_type & 0x80) != 0 { 8 } else { 1 };
+
+            for function in 0..max_functions {
+                let func_vendor_id = unsafe { pci_read_16(bus, device, function, 0x00) };
+                if func_vendor_id == 0xFFFF {
+                    continue;
+                }
+
+                let device_id = unsafe { pci_read_16(bus, device, function, 0x02) };
+                let class_subclass = unsafe { pci_read_16(bus, device, function, 0x0A) };
+                let class = PciClass::from((class_subclass >> 8) as u8);
+                let subclass = (class_subclass & 0xFF) as u8;
+                let prog_if = unsafe { pci_read_8(bus, device, function, 0x09) };
+                let revision = unsafe { pci_read_8(bus, device, function, 0x08) };
+                let func_header_type = unsafe { pci_read_8(bus, device, function, 0x0E) } & 0x7F;
+
+                let mut bars = [Bar::Empty; 6];
+                if func_header_type == 0x00 {
+                    let mut i = 0;
+                    while i < 6 {
+                        let (bar, is_64) = unsafe { read_bar(bus, device, function, i) };
+                        bars[i] = bar;
+                        if is_64 {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+
+                devices.push(PciDevice {
+                    address: PciAddress { bus, device, function },
+                    vendor_id: func_vendor_id,
+                    device_id,
+                    class,
+                    subclass,
+                    prog_if,
+                    revision,
+                    header_type: func_header_type,
+                    bars,
+                });
+            }
+        }
+    }
+
+    devices
 }
