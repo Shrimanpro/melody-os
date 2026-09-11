@@ -298,3 +298,24 @@ pub fn scan_pci_bus() -> Vec<PciDevice> {
 
     devices
 }
+
+/// Find the SATA AHCI Controller (Class 0x01, Subclass 0x06, ProgIF 0x01)
+pub fn find_ahci_controller(devices: &[PciDevice]) -> Option<PciDevice> {
+    devices.iter().find(|d| {
+        d.class == PciClass::MassStorage && d.subclass == 0x06 && d.prog_if == 0x01
+    }).cloned()
+}
+
+/// Find the Intel High Definition Audio (HDA) Controller (Class 0x04, Subclass 0x03)
+pub fn find_hda_controller(devices: &[PciDevice]) -> Option<PciDevice> {
+    devices.iter().find(|d| {
+        d.class == PciClass::Multimedia && d.subclass == 0x03
+    }).cloned()
+}
+
+/// Find an Ethernet Network Interface Card (Class 0x02, Subclass 0x00)
+pub fn find_network_controller(devices: &[PciDevice]) -> Option<PciDevice> {
+    devices.iter().find(|d| {
+        d.class == PciClass::Network && d.subclass == 0x00
+    }).cloned()
+}
