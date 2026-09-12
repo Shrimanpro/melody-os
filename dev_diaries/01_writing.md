@@ -16,3 +16,11 @@ I made a function that automatically writes a character. From my knowledge of my
 # Future Proof
 
 Now rust is a language that changes often. What I mean by that is that, my code can break after a random rust update. To run this, I'm on the nightly channel (the beta), so I can expect small bugs here and there. To prevent this, we can "hard code" some things. For example, writing could be really optimized in the next rust update. However, that could easily break the entire OS. So we make it volatile (telling the compiler don't optimize or modify this, it's important). This was easily done by adding a simple volatile layer around the vital pieces of code. 
+
+# Macro Problems
+
+Logically, the first step to see if everything works fine is to print "Hello World". But we can't really do that, because we don't have a print function. In rust, those types of functions are called macros, and we have to overwrite them. Before that, we have to make sure our small print function (not macro) works flawlessly. Well, it does not work flawlessly, because for some reason, it can't accept floats, only integers as formatting. This is done by using the in-built write! macro. 
+
+After spending way too long on this, I decided to move on and find out why this isn't working later. The next thing to do is to print an empty line for the eventual println! macro. This was simple and similar to the text editor new line. Like the editor, we needed a singular writer to print things onto the screen. This "object" needs to be static and be safe to access. So we can use mutexes to try again and again instead of skipping or blocking the instruction.
+
+Finally, we can put everything together and make the macros. You can actually see the original print! and println! macros, and how they work in code. By changing a few variables, we get our own print macros. After all this work, we finally get the thing most people take for granted, println!("Hello World!"). I've also added a panic handler with the println! macro to easily problems that could arise in the future.
