@@ -1,0 +1,21 @@
+[package]
+name = "melody_os"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# updating bootloder from 0.9.23 to latest
+# because it new nightly broke everything
+bootloader = "0.9.35"
+volatile = "=0.2.6"
+spin = "0.5.2"
+
+[dependencies.lazy_static]
+version = "1.0"
+features = ["spin_no_std"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
