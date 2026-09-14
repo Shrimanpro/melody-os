@@ -60,3 +60,52 @@ pub struct HbaMemory {
     pub vendor: [u8; 96],
     pub ports: [HbaPort; 32],
 }
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct HbaCmdHeader {
+    pub flags: u16,
+    pub prdtl: u16,
+    pub prdbc: u32,
+    pub ctba: u32,
+    pub ctbau: u32,
+    pub reserved: [u32; 4],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct HbaPrdtEntry {
+    pub dba: u32,
+    pub dbau: u32,
+    pub reserved: u32,
+    pub dbc: u32, // bit 31: IOC, bits 0-21: byte count (must be odd, i.e. bytes - 1)
+}
+
+#[repr(C, packed)]
+pub struct HbaCmdTable {
+    pub cfis: [u8; 64],
+    pub acmd: [u8; 16],
+    pub reserved: [u8; 48],
+    pub prdt_entry: [HbaPrdtEntry; 1],
+}
+
+#[repr(C, packed)]
+pub struct FisRegH2D {
+    pub fis_type: u8,
+    pub pm_port_c: u8,
+    pub command: u8,
+    pub feature_low: u8,
+    pub lba0: u8,
+    pub lba1: u8,
+    pub lba2: u8,
+    pub device: u8,
+    pub lba3: u8,
+    pub lba4: u8,
+    pub lba5: u8,
+    pub feature_high: u8,
+    pub count_low: u8,
+    pub count_high: u8,
+    pub icc: u8,
+    pub control: u8,
+    pub reserved: [u8; 4],
+}
