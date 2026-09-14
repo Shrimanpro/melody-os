@@ -1,4 +1,9 @@
+use alloc::vec::Vec;
+use core::ptr::write_bytes;
 use volatile::Volatile;
+use x86_64::VirtAddr;
+
+use crate::pci::{Bar, PciDevice};
 
 pub const HBA_PORT_DET_PRESENT: u32 = 0x3;
 pub const HBA_PORT_IPM_ACTIVE: u32 = 0x1;
@@ -108,4 +113,17 @@ pub struct FisRegH2D {
     pub icc: u8,
     pub control: u8,
     pub reserved: [u8; 4],
+}
+
+pub fn check_port_type(port: &HbaPort) -> bool {
+    let ssts = port.ssts.read();
+    let ipm = (ssts >> 8) & 0x0F;
+    let det = ssts & 0x0F;
+
+    if det == HBA_PORT_DET_PRESENT && ipm == HBA_PORT_IPM_ACTIVE {
+        let sig = port.sig.read();
+        sig == SATA_SIG_ATA
+    } else {
+        false
+    }
 }
