@@ -127,3 +127,55 @@ pub fn check_port_type(port: &HbaPort) -> bool {
         false
     }
 }
+
+pub struct AhciPortState {
+    pub port_index: usize,
+    pub cmd_list_phys: u64,
+    pub cmd_list_virt: *mut HbaCmdHeader,
+    pub fis_phys: u64,
+    pub fis_virt: *mut u8,
+    pub cmd_table_phys: u64,
+    pub cmd_table_virt: *mut HbaCmdTable,
+    pub bounce_buffer_phys: u64,
+    pub bounce_buffer_virt: *mut u8,
+}
+
+pub struct AhciPortBuffers {
+    pub cmd_list_phys: u64,
+    pub cmd_list_virt: *mut HbaCmdHeader,
+    pub fis_phys: u64,
+    pub fis_virt: *mut u8,
+    pub cmd_table_phys: u64,
+    pub cmd_table_virt: *mut HbaCmdTable,
+    pub bounce_buffer_phys: u64,
+    pub bounce_buffer_virt: *mut u8,
+}
+
+pub unsafe fn allocate_port_buffers(phys_offset: u64) -> AhciPortBuffers {
+    let cmd_list_buf = alloc::vec![0u8; 1024].leak();
+    let cmd_list_virt = cmd_list_buf.as_mut_ptr() as *mut HbaCmdHeader;
+    let cmd_list_phys = if (cmd_list_virt as u64) >= phys_offset { (cmd_list_virt as u64) - phys_offset } else { cmd_list_virt as u64 };
+
+    let fis_buf = alloc::vec![0u8; 256].leak();
+    let fis_virt = fis_buf.as_mut_ptr();
+    let fis_phys = if (fis_virt as u64) >= phys_offset { (fis_virt as u64) - phys_offset } else { fis_virt as u64 };
+
+    let cmd_table_buf = alloc::vec![0u8; 256].leak();
+    let cmd_table_virt = cmd_table_buf.as_mut_ptr() as *mut HbaCmdTable;
+    let cmd_table_phys = if (cmd_table_virt as u64) >= phys_offset { (cmd_table_virt as u64) - phys_offset } else { cmd_table_virt as u64 };
+
+    let bounce_buf = alloc::vec![0u8; 64 * 1024].leak();
+    let bounce_buffer_virt = bounce_buf.as_mut_ptr();
+    let bounce_buffer_phys = if (bounce_buffer_virt as u64) >= phys_offset { (bounce_buffer_virt as u64) - phys_offset } else { bounce_buffer_virt as u64 };
+
+    AhciPortBuffers {
+        cmd_list_phys,
+        cmd_list_virt,
+        fis_phys,
+        fis_virt,
+        cmd_table_phys,
+        cmd_table_virt,
+        bounce_buffer_phys,
+        bounce_buffer_virt,
+    }
+}
