@@ -179,3 +179,154 @@ pub unsafe fn allocate_port_buffers(phys_offset: u64) -> AhciPortBuffers {
         bounce_buffer_virt,
     }
 }
+
+pub struct AhciController {
+    pub hba: &'static mut HbaMemory,
+    pub phys_mem_offset: VirtAddr,
+    pub active_ports: Vec<AhciPortState>,
+}
+
+impl AhciController {
+    /// Initialize AHCI Controller from its PCI device and the kernel's physical memory offset
+    pub unsafe fn new(pci_dev: &PciDevice, phys_mem_offset: VirtAddr) -> Result<Self, &'static str> {
+        // Enable bus mastering & memory space in PCI
+        unsafe { pci_dev.enable_bus_mastering() };
+
+        let abar_phys = match pci_dev.bars[5] {
+            Bar::Memory32 { address, .. } => address as u64,
+            Bar::Memory64 { address, .. } => address,
+            _ => return Err("AHCI ABAR (BAR5) is not a memory BAR"),
+        };
+
+        let abar_virt = (phys_mem_offset + abar_phys).as_mut_ptr::<HbaMemory>();
+        let hba = unsafe { &mut *abar_virt };
+
+        // Enable AHCI mode (GHC.AE = bit 31)
+        let ghc = hba.ghc.read();
+        hba.ghc.write(ghc | (1 << 31));
+
+        let mut controller = AhciController {
+            hba,
+            phys_mem_offset,
+            active_ports: Vec::new(),
+        };
+
+        controller.probe_ports();
+        Ok(controller)
+    }
+
+    fn probe_ports(&mut self) {
+        let pi = self.hba.pi.read();
+        for i in 0..32 {
+            if (pi & (1 << i)) != 0 {
+                let port = &mut self.hba.ports[i];
+                let ssts = port.ssts.read();
+                let ipm = (ssts >> 8) & 0x0F;
+                let det = ssts & 0x0F;
+
+                if det == HBA_PORT_DET_PRESENT && ipm == HBA_PORT_IPM_ACTIVE {
+                    let sig = port.sig.read();
+                    if sig == SATA_SIG_ATA {
+                        crate::println!("AHCI: Found SATA drive on port {}", i);
+                        unsafe {
+                            if let Ok(state) = self.configure_port(i) {
+                                self.active_ports.push(state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe fn configure_port(&mut self, port_idx: usize) -> Result<AhciPortState, &'static str> {
+        let phys_offset = self.phys_mem_offset.as_u64();
+        let port = &mut self.hba.ports[port_idx];
+
+        // 1. Stop command execution on port
+        Self::stop_port(port);
+
+        // 2. Allocate DMA memory buffers:
+        // Command list: 32 entries * 32 bytes = 1024 bytes (1K aligned)
+        let cmd_list_buf = alloc::vec![0u8; 1024].leak();
+        let cmd_list_virt = cmd_list_buf.as_mut_ptr() as *mut HbaCmdHeader;
+        let cmd_list_phys = if (cmd_list_virt as u64) >= phys_offset { (cmd_list_virt as u64) - phys_offset } else { cmd_list_virt as u64 };
+
+        // Received FIS: 256 bytes (256-byte aligned)
+        let fis_buf = alloc::vec![0u8; 256].leak();
+        let fis_virt = fis_buf.as_mut_ptr();
+        let fis_phys = if (fis_virt as u64) >= phys_offset { (fis_virt as u64) - phys_offset } else { fis_virt as u64 };
+
+        // Command table: 1 entry with 1 PRDT entry = 256 bytes (128-byte aligned)
+        let cmd_table_buf = alloc::vec![0u8; 256].leak();
+        let cmd_table_virt = cmd_table_buf.as_mut_ptr() as *mut HbaCmdTable;
+        let cmd_table_phys = if (cmd_table_virt as u64) >= phys_offset { (cmd_table_virt as u64) - phys_offset } else { cmd_table_virt as u64 };
+
+        // Bounce buffer for sector transfers (64 KiB)
+        let bounce_buf = alloc::vec![0u8; 64 * 1024].leak();
+        let bounce_buffer_virt = bounce_buf.as_mut_ptr();
+        let bounce_buffer_phys = if (bounce_buffer_virt as u64) >= phys_offset { (bounce_buffer_virt as u64) - phys_offset } else { bounce_buffer_virt as u64 };
+
+        // Program port registers
+        port.clb.write((cmd_list_phys & 0xFFFFFFFF) as u32);
+        port.clbu.write(((cmd_list_phys >> 32) & 0xFFFFFFFF) as u32);
+
+        port.fb.write((fis_phys & 0xFFFFFFFF) as u32);
+        port.fbu.write(((fis_phys >> 32) & 0xFFFFFFFF) as u32);
+
+        // Set command table address in slot 0
+        let cmd_header = unsafe { &mut *cmd_list_virt };
+        cmd_header.ctba = (cmd_table_phys & 0xFFFFFFFF) as u32;
+        cmd_header.ctbau = ((cmd_table_phys >> 32) & 0xFFFFFFFF) as u32;
+
+        // Clear error and interrupt registers
+        port.serr.write(0xFFFFFFFF);
+        port.is.write(0xFFFFFFFF);
+
+        // 3. Start port
+        Self::start_port(port);
+
+        Ok(AhciPortState {
+            port_index: port_idx,
+            cmd_list_phys,
+            cmd_list_virt,
+            fis_phys,
+            fis_virt,
+            cmd_table_phys,
+            cmd_table_virt,
+            bounce_buffer_phys,
+            bounce_buffer_virt,
+        })
+    }
+
+    fn stop_port(port: &mut HbaPort) {
+        let mut cmd = port.cmd.read();
+        cmd &= !HBA_PXCMD_ST;
+        cmd &= !HBA_PXCMD_FRE;
+        port.cmd.write(cmd);
+
+        let mut timeout = 100_000;
+        while timeout > 0 {
+            let c = port.cmd.read();
+            if (c & HBA_PXCMD_FR) == 0 && (c & HBA_PXCMD_CR) == 0 {
+                break;
+            }
+            timeout -= 1;
+        }
+    }
+
+    fn start_port(port: &mut HbaPort) {
+        let mut timeout = 100_000;
+        while timeout > 0 {
+            if (port.cmd.read() & HBA_PXCMD_CR) == 0 {
+                break;
+            }
+            timeout -= 1;
+        }
+
+        let mut cmd = port.cmd.read();
+        cmd |= HBA_PXCMD_FRE;
+        cmd |= HBA_PXCMD_ST;
+        port.cmd.write(cmd);
+    }
+}
