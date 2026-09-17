@@ -329,6 +329,79 @@ impl AhciController {
         cmd |= HBA_PXCMD_ST;
         port.cmd.write(cmd);
     }
+
+    /// Read raw 512-byte sectors from the SATA drive into `buf`.
+    pub fn read_sectors(
+        &mut self,
+        active_port_idx: usize,
+        lba: u64,
+        sector_count: u16,
+        buf: &mut [u8],
+    ) -> Result<(), &'static str> {
+        if active_port_idx >= self.active_ports.len() {
+            return Err("Invalid active port index");
+        }
+        let total_bytes = (sector_count as usize) * 512;
+        if buf.len() < total_bytes {
+            return Err("Destination buffer too small");
+        }
+
+        let port_state = &self.active_ports[active_port_idx];
+        let port = &mut self.hba.ports[port_state.port_index];
+
+        port.is.write(0xFFFFFFFF);
+
+        unsafe {
+            // Setup Command Header (Slot 0)
+            let cmd_header = &mut *port_state.cmd_list_virt;
+            let cfl = (core::mem::size_of::<FisRegH2D>() / 4) as u16;
+            // bit 6 is 0 for Read, CFL in bits 0-4
+            cmd_header.flags = cfl;
+            cmd_header.prdtl = 1;
+            cmd_header.prdbc = 0;
+
+            // Setup PRDT Entry
+            let cmd_table = &mut *port_state.cmd_table_virt;
+            write_bytes(cmd_table as *mut HbaCmdTable as *mut u8, 0, 256);
+
+            cmd_table.prdt_entry[0].dba = (port_state.bounce_buffer_phys & 0xFFFFFFFF) as u32;
+            cmd_table.prdt_entry[0].dbau = ((port_state.bounce_buffer_phys >> 32) & 0xFFFFFFFF) as u32;
+            // dbc: size - 1, bit 31 is interrupt on completion (optional)
+            cmd_table.prdt_entry[0].dbc = (total_bytes as u32 - 1) | (1 << 31);
+
+            // Setup Command FIS (Register H2D)
+            let fis = &mut *(cmd_table.cfis.as_mut_ptr() as *mut FisRegH2D);
+            construct_read_fis(fis, lba, sector_count);
+
+            // Wait for port to not be busy
+            let mut spin_count = 0;
+            while (port.tfd.read() & 0x88) != 0 && spin_count < 1_000_000 {
+                spin_count += 1;
+            }
+
+            // Issue command (Slot 0)
+            port.ci.write(1);
+
+            // Wait for completion
+            loop {
+                if (port.ci.read() & 1) == 0 {
+                    break;
+                }
+                if (port.is.read() & (1 << 30)) != 0 {
+                    return Err("AHCI: Disk read error occurred");
+                }
+            }
+
+            // Copy data from bounce buffer into user buffer
+            core::ptr::copy_nonoverlapping(
+                port_state.bounce_buffer_virt,
+                buf.as_mut_ptr(),
+                total_bytes,
+            );
+        }
+
+        Ok(())
+    }
 }
 
 pub fn construct_read_fis(fis: &mut FisRegH2D, lba: u64, sector_count: u16) {
