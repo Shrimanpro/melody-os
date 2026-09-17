@@ -330,3 +330,21 @@ impl AhciController {
         port.cmd.write(cmd);
     }
 }
+
+pub fn construct_read_fis(fis: &mut FisRegH2D, lba: u64, sector_count: u16) {
+    fis.fis_type = FIS_TYPE_REG_H2D;
+    fis.pm_port_c = 1 << 7; // Command bit
+    fis.command = ATA_CMD_READ_DMA_EXT;
+
+    fis.lba0 = (lba & 0xFF) as u8;
+    fis.lba1 = ((lba >> 8) & 0xFF) as u8;
+    fis.lba2 = ((lba >> 16) & 0xFF) as u8;
+    fis.device = 1 << 6; // LBA mode
+
+    fis.lba3 = ((lba >> 24) & 0xFF) as u8;
+    fis.lba4 = ((lba >> 32) & 0xFF) as u8;
+    fis.lba5 = ((lba >> 40) & 0xFF) as u8;
+
+    fis.count_low = (sector_count & 0xFF) as u8;
+    fis.count_high = ((sector_count >> 8) & 0xFF) as u8;
+}
