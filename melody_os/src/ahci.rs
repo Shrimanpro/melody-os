@@ -421,3 +421,21 @@ pub fn construct_read_fis(fis: &mut FisRegH2D, lba: u64, sector_count: u16) {
     fis.count_low = (sector_count & 0xFF) as u8;
     fis.count_high = ((sector_count >> 8) & 0xFF) as u8;
 }
+
+pub struct AhciDriver {
+    pub controller: AhciController,
+    pub drive_port: usize,
+}
+
+impl AhciDriver {
+    pub fn new(controller: AhciController, drive_port: usize) -> Result<Self, &'static str> {
+        if drive_port >= controller.active_ports.len() {
+            return Err("Selected drive port is not active");
+        }
+        Ok(Self { controller, drive_port })
+    }
+
+    pub fn read_sector(&mut self, lba: u64, buf: &mut [u8; 512]) -> Result<(), &'static str> {
+        self.controller.read_sectors(self.drive_port, lba, 1, buf)
+    }
+}
