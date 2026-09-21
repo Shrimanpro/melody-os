@@ -225,4 +225,32 @@ impl<'a, D: BlockDevice> Fat32FileSystem<'a, D> {
 
         Ok(entries)
     }
+
+    /// Read an entire file into memory as a vector of bytes.
+    pub fn read_file(&mut self, entry: &FatDirEntry) -> Result<Vec<u8>, &'static str> {
+        let mut data = Vec::with_capacity(entry.size as usize);
+        let mut current_cluster = Some(entry.first_cluster);
+        let mut remaining = entry.size as usize;
+        let mut sector_buf = [0u8; 512];
+
+        while let Some(cluster) = current_cluster {
+            let start_lba = self.cluster_to_lba(cluster);
+            for s in 0..self.bpb.sectors_per_cluster {
+                if remaining == 0 {
+                    break;
+                }
+                self.device.read_sector(start_lba + s as u64, &mut sector_buf)?;
+                let to_copy = remaining.min(512);
+                data.extend_from_slice(&sector_buf[..to_copy]);
+                remaining -= to_copy;
+            }
+
+            if remaining == 0 {
+                break;
+            }
+            current_cluster = self.next_cluster(cluster)?;
+        }
+
+        Ok(data)
+    }
 }
