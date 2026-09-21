@@ -111,4 +111,32 @@ impl<'a, D: BlockDevice> Fat32FileSystem<'a, D> {
             partition_lba,
         })
     }
+
+    pub fn cluster_to_lba(&self, cluster: u32) -> u64 {
+        self.bpb.data_lba + ((cluster - 2) as u64) * (self.bpb.sectors_per_cluster as u64)
+    }
+
+    pub fn next_cluster(&mut self, current_cluster: u32) -> Result<Option<u32>, &'static str> {
+        let fat_offset = (current_cluster as u64) * 4;
+        let fat_sector_lba = self.bpb.fat_lba + (fat_offset / 512);
+        let sector_offset = (fat_offset % 512) as usize;
+
+        let mut sector = [0u8; 512];
+        self.device.read_sector(fat_sector_lba, &mut sector)?;
+
+        let next = u32::from_le_bytes([
+            sector[sector_offset],
+            sector[sector_offset + 1],
+            sector[sector_offset + 2],
+            sector[sector_offset + 3],
+        ]) & 0x0FFFFFFF;
+
+        if next >= 0x0FFFFFF8 {
+            Ok(None) // End of cluster chain
+        } else if next == 0x0FFFFFF7 {
+            Err("Encountered bad cluster in FAT")
+        } else {
+            Ok(Some(next))
+        }
+    }
 }
