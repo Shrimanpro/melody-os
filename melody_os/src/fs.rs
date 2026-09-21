@@ -1,6 +1,17 @@
+use alloc::string::String;
+use alloc::vec::Vec;
+
 /// Trait for a generic block storage device that can read 512-byte sectors.
 pub trait BlockDevice {
     fn read_sector(&mut self, lba: u64, buffer: &mut [u8; 512]) -> Result<(), &'static str>;
+}
+
+#[derive(Debug, Clone)]
+pub struct FatDirEntry {
+    pub name: String,
+    pub is_directory: bool,
+    pub size: u32,
+    pub first_cluster: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,5 +149,80 @@ impl<'a, D: BlockDevice> Fat32FileSystem<'a, D> {
         } else {
             Ok(Some(next))
         }
+    }
+
+    pub fn list_directory(&mut self, dir_cluster: u32) -> Result<Vec<FatDirEntry>, &'static str> {
+        let mut entries = Vec::new();
+        let mut current_cluster = Some(dir_cluster);
+        let mut sector_buf = [0u8; 512];
+
+        while let Some(cluster) = current_cluster {
+            let start_lba = self.cluster_to_lba(cluster);
+            for s in 0..self.bpb.sectors_per_cluster {
+                self.device.read_sector(start_lba + s as u64, &mut sector_buf)?;
+
+                for entry_idx in 0..(512 / 32) {
+                    let offset = entry_idx * 32;
+                    let first_byte = sector_buf[offset];
+                    if first_byte == 0x00 {
+                        // End of directory entries
+                        return Ok(entries);
+                    }
+                    if first_byte == 0xE5 {
+                        // Deleted entry
+                        continue;
+                    }
+
+                    let attr = sector_buf[offset + 11];
+                    if attr == 0x0F {
+                        // Long filename entry (skip for basic parser)
+                        continue;
+                    }
+
+                    // Format 8.3 filename
+                    let mut name = String::new();
+                    let raw_name = &sector_buf[offset..offset + 8];
+                    let raw_ext = &sector_buf[offset + 8..offset + 11];
+
+                    for &b in raw_name {
+                        if b != b' ' {
+                            name.push(b as char);
+                        }
+                    }
+                    let mut ext = String::new();
+                    for &b in raw_ext {
+                        if b != b' ' {
+                            ext.push(b as char);
+                        }
+                    }
+                    if !ext.is_empty() {
+                        name.push('.');
+                        name.push_str(&ext);
+                    }
+
+                    let is_directory = (attr & 0x10) != 0;
+                    let cluster_high = u16::from_le_bytes([sector_buf[offset + 20], sector_buf[offset + 21]]) as u32;
+                    let cluster_low = u16::from_le_bytes([sector_buf[offset + 26], sector_buf[offset + 27]]) as u32;
+                    let file_first_cluster = (cluster_high << 16) | cluster_low;
+                    let size = u32::from_le_bytes([
+                        sector_buf[offset + 28],
+                        sector_buf[offset + 29],
+                        sector_buf[offset + 30],
+                        sector_buf[offset + 31],
+                    ]);
+
+                    entries.push(FatDirEntry {
+                        name,
+                        is_directory,
+                        size,
+                        first_cluster: file_first_cluster,
+                    });
+                }
+            }
+
+            current_cluster = self.next_cluster(cluster)?;
+        }
+
+        Ok(entries)
     }
 }
