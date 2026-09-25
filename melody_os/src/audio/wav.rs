@@ -17,7 +17,7 @@ pub struct WavAudio<'a> {
 }
 
 impl<'a> WavAudio<'a> {
-    pub fn validate_riff(bytes: &'a [u8]) -> Result<(), &'static str> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, &'static str> {
         if bytes.len() < 44 {
             return Err("WAV data too short (less than 44 bytes)");
         }
@@ -30,6 +30,87 @@ impl<'a> WavAudio<'a> {
             return Err("Invalid WAVE format signature");
         }
 
-        Ok(())
+        // Search for "fmt " chunk
+        let mut offset = 12;
+        let mut fmt_header = None;
+        let mut data_chunk = None;
+
+        while offset + 8 <= bytes.len() {
+            let chunk_id = &bytes[offset..offset + 4];
+            let chunk_size = u32::from_le_bytes([
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+                bytes[offset + 7],
+            ]) as usize;
+
+            let chunk_data_offset = offset + 8;
+            if chunk_data_offset + chunk_size > bytes.len() {
+                break;
+            }
+
+            if chunk_id == b"fmt " {
+                if chunk_size < 16 {
+                    return Err("fmt chunk too small");
+                }
+                let audio_format = u16::from_le_bytes([bytes[chunk_data_offset], bytes[chunk_data_offset + 1]]);
+                if audio_format != 1 {
+                    // 1 = PCM
+                    return Err("Only uncompressed PCM WAV files are supported");
+                }
+                let num_channels = u16::from_le_bytes([bytes[chunk_data_offset + 2], bytes[chunk_data_offset + 3]]);
+                let sample_rate = u32::from_le_bytes([
+                    bytes[chunk_data_offset + 4],
+                    bytes[chunk_data_offset + 5],
+                    bytes[chunk_data_offset + 6],
+                    bytes[chunk_data_offset + 7],
+                ]);
+                let byte_rate = u32::from_le_bytes([
+                    bytes[chunk_data_offset + 8],
+                    bytes[chunk_data_offset + 9],
+                    bytes[chunk_data_offset + 10],
+                    bytes[chunk_data_offset + 11],
+                ]);
+                let block_align = u16::from_le_bytes([bytes[chunk_data_offset + 12], bytes[chunk_data_offset + 13]]);
+                let bits_per_sample = u16::from_le_bytes([bytes[chunk_data_offset + 14], bytes[chunk_data_offset + 15]]);
+
+                fmt_header = Some((num_channels, sample_rate, byte_rate, block_align, bits_per_sample));
+            } else if chunk_id == b"data" {
+                data_chunk = Some((chunk_data_offset, chunk_size));
+                break;
+            }
+
+            offset = chunk_data_offset + chunk_size;
+            // Chunks are 2-byte aligned
+            if (offset % 2) != 0 {
+                offset += 1;
+            }
+        }
+
+        let (num_channels, sample_rate, byte_rate, block_align, bits_per_sample) =
+            fmt_header.ok_or("Missing fmt chunk in WAV file")?;
+        let (data_offset, data_size) =
+            data_chunk.ok_or("Missing data chunk in WAV file")?;
+
+        let header = WavHeader {
+            num_channels,
+            sample_rate,
+            byte_rate,
+            block_align,
+            bits_per_sample,
+            data_offset,
+            data_size,
+        };
+
+        Ok(WavAudio {
+            header,
+            raw_data: bytes,
+        })
+    }
+
+    /// Returns a slice containing only the raw PCM sample bytes (RIFF header stripped)
+    pub fn samples(&self) -> &'a [u8] {
+        let end = self.header.data_offset + self.header.data_size;
+        &self.raw_data[self.header.data_offset..end.min(self.raw_data.len())]
     }
 }
