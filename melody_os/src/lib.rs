@@ -11,6 +11,7 @@ use core::panic::PanicInfo;
 
 pub mod ahci;
 pub mod allocator;
+pub mod audio;
 pub mod fs;
 pub mod gdt;
 pub mod interrupts;
