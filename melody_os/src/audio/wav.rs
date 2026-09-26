@@ -113,4 +113,35 @@ impl<'a> WavAudio<'a> {
         let end = self.header.data_offset + self.header.data_size;
         &self.raw_data[self.header.data_offset..end.min(self.raw_data.len())]
     }
+
+    /// Compute HDA stream format bitfield for this audio track
+    pub fn hda_format(&self) -> u16 {
+        calculate_hda_format(self.header.sample_rate, self.header.num_channels, self.header.bits_per_sample)
+    }
+}
+
+pub fn calculate_hda_format(sample_rate: u32, num_channels: u16, bits_per_sample: u16) -> u16 {
+    // Base rate: 0 for 48 kHz, 1 for 44.1 kHz
+    let base_rate_bit = if sample_rate == 44100 { 1u16 << 14 } else { 0u16 };
+
+    // Bits per sample:
+    // 000: 8 bits
+    // 001: 16 bits
+    // 010: 20 bits
+    // 011: 24 bits
+    // 100: 32 bits
+    let bits_val = match bits_per_sample {
+        8 => 0,
+        16 => 1,
+        20 => 2,
+        24 => 3,
+        32 => 4,
+        _ => 1,
+    };
+    let bits_field = (bits_val as u16) << 4;
+
+    // Number of channels - 1 (e.g. 0 for mono, 1 for stereo)
+    let channels_field = (num_channels.saturating_sub(1)) & 0x0F;
+
+    base_rate_bit | bits_field | channels_field
 }
