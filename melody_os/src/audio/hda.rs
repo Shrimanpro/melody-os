@@ -31,3 +31,71 @@ pub struct HdaStreamRegs {
     pub bdlpl: Volatile<u32>,
     pub bdlpu: Volatile<u32>,
 }
+
+pub struct HdaController {
+    base_virt: *mut u8,
+}
+
+impl HdaController {
+    pub unsafe fn reset_controller(base_virt: *mut u8) {
+        unsafe {
+            let gctl_ptr = base_virt.add(0x08) as *mut u32;
+            let mut gctl = core::ptr::read_volatile(gctl_ptr);
+
+            // Clear CRST to reset
+            gctl &= !HDA_GCTL_CRST;
+            core::ptr::write_volatile(gctl_ptr, gctl);
+
+            let mut timeout = 0;
+            while (core::ptr::read_volatile(gctl_ptr) & HDA_GCTL_CRST) != 0 && timeout < 100_000 {
+                timeout += 1;
+            }
+
+            // Set CRST to exit reset
+            gctl |= HDA_GCTL_CRST;
+            core::ptr::write_volatile(gctl_ptr, gctl);
+
+            timeout = 0;
+            while (core::ptr::read_volatile(gctl_ptr) & HDA_GCTL_CRST) == 0 && timeout < 100_000 {
+                timeout += 1;
+            }
+        }
+    }
+
+    /// Send an Immediate Command to the codec and wait for response
+    pub fn send_verb(&self, codec: u8, nid: u8, verb: u32, payload: u32) -> u32 {
+        let command = ((codec as u32 & 0x0F) << 28)
+            | ((nid as u32 & 0xFF) << 20)
+            | ((verb & 0xFFF) << 8)
+            | (payload & 0xFF);
+
+        unsafe {
+            let icw = self.base_virt.add(0x60) as *mut u32;
+            let irr = self.base_virt.add(0x64) as *const u32;
+            let ics = self.base_virt.add(0x68) as *mut u16;
+
+            // Wait until Immediate Command is not busy
+            let mut timeout = 0;
+            while (core::ptr::read_volatile(ics) & HDA_ICS_ICB) != 0 && timeout < 100_000 {
+                timeout += 1;
+            }
+
+            // Write command
+            core::ptr::write_volatile(icw, command);
+
+            // Trigger command (set ICB and clear IRV)
+            core::ptr::write_volatile(ics, HDA_ICS_ICB | HDA_ICS_IRV);
+
+            // Wait for response (IRV set, ICB clear)
+            timeout = 0;
+            while ((core::ptr::read_volatile(ics) & HDA_ICS_ICB) != 0
+                || (core::ptr::read_volatile(ics) & HDA_ICS_IRV) == 0)
+                && timeout < 100_000
+            {
+                timeout += 1;
+            }
+
+            core::ptr::read_volatile(irr)
+        }
+    }
+}
