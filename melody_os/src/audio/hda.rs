@@ -98,4 +98,18 @@ impl HdaController {
             core::ptr::read_volatile(irr)
         }
     }
+
+    /// Configure codec widgets for Line Out and digital S/PDIF optical output
+    pub fn configure_codecs(&mut self) {
+        crate::println!("HDA: Initializing audio codec and activating S/PDIF & Line Out...");
+
+        for nid in 2..=16 {
+            // Unmute amplifiers on audio nodes
+            self.send_verb(0, nid, 0x3, 0xB07F); // Output amp: unmute, max volume
+            self.send_verb(0, nid, 0x705, 0x00); // Power state: D0 (active)
+            self.send_verb(0, nid, 0x707, 0x45); // Pin widget control: enable output + vref
+            self.send_verb(0, nid, 0x70D, 0x01); // S/PDIF digital output enable
+            self.send_verb(0, nid, 0x706, 0x10); // Assign to Stream ID 1, channel 0
+        }
+    }
 }
