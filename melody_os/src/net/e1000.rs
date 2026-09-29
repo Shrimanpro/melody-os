@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use x86_64::VirtAddr;
 
 use crate::pci::{Bar, PciDevice};
@@ -208,5 +209,58 @@ impl E1000Driver {
             tx_buffers,
             tx_cur: 0,
         })
+    }
+
+    /// Transmit a packet over Ethernet
+    pub fn send_packet(&mut self, packet: &[u8]) -> Result<(), &'static str> {
+        if packet.len() > PKT_BUF_SIZE {
+            return Err("Packet exceeds maximum transmission unit");
+        }
+
+        let desc = unsafe { &mut *self.tx_descs.add(self.tx_cur) };
+        // Wait until previous transmission in this slot is done
+        while (desc.status & E1000_TXD_STAT_DD) == 0 {
+            core::hint::spin_loop();
+        }
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(packet.as_ptr(), self.tx_buffers[self.tx_cur], packet.len());
+        }
+
+        desc.length = packet.len() as u16;
+        desc.cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
+        desc.status = 0;
+
+        self.tx_cur = (self.tx_cur + 1) % NUM_TX_DESCS;
+        unsafe {
+            core::ptr::write_volatile(self.mmio_base.add(E1000_REG_TDT) as *mut u32, self.tx_cur as u32);
+        }
+
+        Ok(())
+    }
+
+    /// Receive a packet from the network if one is available
+    pub fn receive_packet(&mut self) -> Option<Vec<u8>> {
+        let desc = unsafe { &mut *self.rx_descs.add(self.rx_cur) };
+        if (desc.status & E1000_RXD_STAT_DD) == 0 {
+            return None;
+        }
+
+        let len = desc.length as usize;
+        let mut packet = alloc::vec![0u8; len];
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.rx_buffers[self.rx_cur], packet.as_mut_ptr(), len);
+        }
+
+        // Reset descriptor status and update tail
+        desc.status = 0;
+        let prev_cur = self.rx_cur;
+        self.rx_cur = (self.rx_cur + 1) % NUM_RX_DESCS;
+
+        unsafe {
+            core::ptr::write_volatile(self.mmio_base.add(E1000_REG_RDT) as *mut u32, prev_cur as u32);
+        }
+
+        Some(packet)
     }
 }
