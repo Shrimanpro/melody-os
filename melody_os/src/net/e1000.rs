@@ -1,3 +1,7 @@
+use x86_64::VirtAddr;
+
+use crate::pci::{Bar, PciDevice};
+
 pub const E1000_REG_CTRL: usize = 0x0000;
 pub const E1000_REG_STATUS: usize = 0x0008;
 pub const E1000_REG_EERD: usize = 0x0014;
@@ -68,4 +72,141 @@ pub struct E1000TxDesc {
     pub status: u8,
     pub css: u8,
     pub special: u16,
+}
+
+pub struct E1000Driver {
+    pub mmio_base: *mut u8,
+    pub mac_addr: [u8; 6],
+    pub rx_descs: *mut E1000RxDesc,
+    pub rx_buffers: [*mut u8; NUM_RX_DESCS],
+    pub rx_cur: usize,
+    pub tx_descs: *mut E1000TxDesc,
+    pub tx_buffers: [*mut u8; NUM_TX_DESCS],
+    pub tx_cur: usize,
+}
+
+impl E1000Driver {
+    pub unsafe fn new(pci_dev: &PciDevice, phys_mem_offset: VirtAddr) -> Result<Self, &'static str> {
+        unsafe { pci_dev.enable_bus_mastering() };
+
+        let bar0_phys = match pci_dev.bars[0] {
+            Bar::Memory32 { address, .. } => address as u64,
+            Bar::Memory64 { address, .. } => address,
+            _ => return Err("E1000 BAR0 is not a memory BAR"),
+        };
+
+        let mmio_base = (phys_mem_offset + bar0_phys).as_mut_ptr::<u8>();
+        let phys_offset = phys_mem_offset.as_u64();
+
+        // 1. Reset controller
+        unsafe {
+            let ctrl = core::ptr::read_volatile(mmio_base.add(E1000_REG_CTRL) as *const u32);
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_CTRL) as *mut u32, ctrl | E1000_CTRL_RST);
+
+            for _ in 0..10_000 {
+                core::hint::spin_loop();
+            }
+
+            // Set Link Up
+            let ctrl = core::ptr::read_volatile(mmio_base.add(E1000_REG_CTRL) as *const u32);
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_CTRL) as *mut u32, ctrl | E1000_CTRL_SLU);
+        }
+
+        // 2. Read MAC Address from Receive Address registers (RAL/RAH)
+        let mut mac_addr = [0u8; 6];
+        unsafe {
+            let ral = core::ptr::read_volatile(mmio_base.add(E1000_REG_RAL) as *const u32);
+            let rah = core::ptr::read_volatile(mmio_base.add(E1000_REG_RAH) as *const u32);
+            mac_addr[0] = (ral & 0xFF) as u8;
+            mac_addr[1] = ((ral >> 8) & 0xFF) as u8;
+            mac_addr[2] = ((ral >> 16) & 0xFF) as u8;
+            mac_addr[3] = ((ral >> 24) & 0xFF) as u8;
+            mac_addr[4] = (rah & 0xFF) as u8;
+            mac_addr[5] = ((rah >> 8) & 0xFF) as u8;
+        }
+        crate::println!(
+            "E1000: MAC Address: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]
+        );
+
+        // 3. Initialize Receive Descriptors
+        let rx_descs_buf = alloc::vec![0u8; NUM_RX_DESCS * core::mem::size_of::<E1000RxDesc>()].leak();
+        let rx_descs = rx_descs_buf.as_mut_ptr() as *mut E1000RxDesc;
+        let rx_descs_phys = if (rx_descs as u64) >= phys_offset { (rx_descs as u64) - phys_offset } else { rx_descs as u64 };
+
+        let mut rx_buffers = [core::ptr::null_mut(); NUM_RX_DESCS];
+        for i in 0..NUM_RX_DESCS {
+            let buf = alloc::vec![0u8; PKT_BUF_SIZE].leak();
+            let buf_virt = buf.as_mut_ptr();
+            let buf_phys = if (buf_virt as u64) >= phys_offset { (buf_virt as u64) - phys_offset } else { buf_virt as u64 };
+            rx_buffers[i] = buf_virt;
+
+            unsafe {
+                let desc = &mut *rx_descs.add(i);
+                desc.addr = buf_phys;
+                desc.status = 0;
+            }
+        }
+
+        unsafe {
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_RDBAL) as *mut u32, (rx_descs_phys & 0xFFFFFFFF) as u32);
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_RDBAH) as *mut u32, ((rx_descs_phys >> 32) & 0xFFFFFFFF) as u32);
+            core::ptr::write_volatile(
+                mmio_base.add(E1000_REG_RDLEN) as *mut u32,
+                (NUM_RX_DESCS * core::mem::size_of::<E1000RxDesc>()) as u32,
+            );
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_RDH) as *mut u32, 0);
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_RDT) as *mut u32, (NUM_RX_DESCS - 1) as u32);
+
+            // Enable Receiver
+            let rctl = E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_BSIZE_2048 | E1000_RCTL_SECRC;
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_RCTL) as *mut u32, rctl);
+        }
+
+        // 4. Initialize Transmit Descriptors
+        let tx_descs_buf = alloc::vec![0u8; NUM_TX_DESCS * core::mem::size_of::<E1000TxDesc>()].leak();
+        let tx_descs = tx_descs_buf.as_mut_ptr() as *mut E1000TxDesc;
+        let tx_descs_phys = if (tx_descs as u64) >= phys_offset { (tx_descs as u64) - phys_offset } else { tx_descs as u64 };
+
+        let mut tx_buffers = [core::ptr::null_mut(); NUM_TX_DESCS];
+        for i in 0..NUM_TX_DESCS {
+            let buf = alloc::vec![0u8; PKT_BUF_SIZE].leak();
+            let buf_virt = buf.as_mut_ptr();
+            let buf_phys = if (buf_virt as u64) >= phys_offset { (buf_virt as u64) - phys_offset } else { buf_virt as u64 };
+            tx_buffers[i] = buf_virt;
+
+            unsafe {
+                let desc = &mut *tx_descs.add(i);
+                desc.addr = buf_phys;
+                desc.cmd = 0;
+                desc.status = E1000_TXD_STAT_DD; // Initially done
+            }
+        }
+
+        unsafe {
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_TDBAL) as *mut u32, (tx_descs_phys & 0xFFFFFFFF) as u32);
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_TDBAH) as *mut u32, ((tx_descs_phys >> 32) & 0xFFFFFFFF) as u32);
+            core::ptr::write_volatile(
+                mmio_base.add(E1000_REG_TDLEN) as *mut u32,
+                (NUM_TX_DESCS * core::mem::size_of::<E1000TxDesc>()) as u32,
+            );
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_TDH) as *mut u32, 0);
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_TDT) as *mut u32, 0);
+
+            // Enable Transmitter
+            let tctl = E1000_TCTL_EN | E1000_TCTL_PSP | (15 << 4) | (0x40 << 12);
+            core::ptr::write_volatile(mmio_base.add(E1000_REG_TCTL) as *mut u32, tctl);
+        }
+
+        Ok(E1000Driver {
+            mmio_base,
+            mac_addr,
+            rx_descs,
+            rx_buffers,
+            rx_cur: 0,
+            tx_descs,
+            tx_buffers,
+            tx_cur: 0,
+        })
+    }
 }
