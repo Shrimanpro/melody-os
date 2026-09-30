@@ -6,6 +6,19 @@ use smoltcp::time::Instant;
 
 use self::e1000::E1000Driver;
 
+pub const STATIC_IP: [u8; 4] = [192, 168, 1, 100];
+pub const GATEWAY_IP: [u8; 4] = [192, 168, 1, 1];
+pub const SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
+
+/// Initialize network parameters with static IP address 192.168.1.100/24 and default gateway 192.168.1.1
+pub fn init_network() {
+    crate::println!(
+        "Net: Static IP configured: {}.{}.{}.{}/24 (Gateway: {}.{}.{}.{})",
+        STATIC_IP[0], STATIC_IP[1], STATIC_IP[2], STATIC_IP[3],
+        GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3]
+    );
+}
+
 pub struct E1000Phy<'a> {
     pub driver: &'a mut E1000Driver,
 }
