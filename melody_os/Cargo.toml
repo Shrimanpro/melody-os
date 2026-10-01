@@ -2,6 +2,8 @@
 name = "melody_os"
 version = "0.1.0"
 edition = "2024"
+authors = ["Melody OS Developers"]
+description = "Lightweight Audiophile Rust Kernel with Intel HDA, S/PDIF, SATA AHCI, and MPD streaming"
 
 [[test]]
 name = "should_panic"
@@ -12,10 +14,8 @@ name = "stack_overflow"
 harness = false
 
 [dependencies]
-# updating bootloder from 0.9.23 to latest
-# because it new nightly broke everything
 bootloader = { version = "0.9.35", features = ["map_physical_memory"] }
-volatile = "=0.2.6"
+volatile = "0.2.6"
 spin = "0.5.2"
 x86_64 = "0.15.5"
 uart_16550 = "0.6.0"
