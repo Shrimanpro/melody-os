@@ -1,4 +1,5 @@
 pub mod e1000;
+pub mod mpd;
 
 use alloc::vec::Vec;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
