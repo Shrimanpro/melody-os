@@ -3,9 +3,22 @@ use spin::Mutex;
 use uart_16550::{Config, Uart16550Tty, backend::PioBackend};
 
 lazy_static! {
-    pub static ref SERIAL1: Mutex<Uart16550Tty<PioBackend>> = Mutex::new(unsafe {
-        Uart16550Tty::new_port(0x3F8, Config::default()).expect("failed to initialize UART")
+    pub static ref SERIAL1: Mutex<Option<Uart16550Tty<PioBackend>>> = Mutex::new({
+        let ports = [0x3F8, 0x2F8, 0x3E8, 0x2E8];
+        let mut serial = None;
+        for &port in &ports {
+            if let Ok(uart) = unsafe { Uart16550Tty::new_port(port, Config::default()) } {
+                serial = Some(uart);
+                break;
+            }
+        }
+        serial
     });
+}
+
+/// Returns true if a hardware UART serial port was detected and initialized.
+pub fn is_present() -> bool {
+    SERIAL1.lock().is_some()
 }
 
 #[doc(hidden)]
@@ -14,10 +27,9 @@ pub fn _print(args: ::core::fmt::Arguments) {
     use x86_64::instructions::interrupts;
 
     interrupts::without_interrupts(|| {
-        SERIAL1
-            .lock()
-            .write_fmt(args)
-            .expect("Printing to serial failed");
+        if let Some(ref mut serial) = *SERIAL1.lock() {
+            let _ = serial.write_fmt(args);
+        }
     });
 }
 
