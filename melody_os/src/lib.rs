@@ -8,6 +8,7 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub mod ahci;
 pub mod allocator;
@@ -21,11 +22,29 @@ pub mod pci;
 pub mod serial;
 pub mod vga_buffer;
 
+/// Set once we've seen the PIT tick; only then is it safe to `hlt` in the main loop.
+static TIMER_WORKS: AtomicBool = AtomicBool::new(false);
+
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
-    unsafe { interrupts::PICS.lock().initialize() };
+    interrupts::calibrate_tsc();
+    unsafe {
+        let mut pics = interrupts::PICS.lock();
+        pics.initialize();
+        // Only IRQ 0 (timer) and IRQ 1 (keyboard). Everything else is polled.
+        pics.write_masks(0xFC, 0xFF);
+    }
+    interrupts::init_pit();
     x86_64::instructions::interrupts::enable();
+
+    let start = interrupts::TIMER_TICKS.load(Ordering::Relaxed);
+    interrupts::delay_ms(20);
+    TIMER_WORKS.store(interrupts::TIMER_TICKS.load(Ordering::Relaxed) > start, Ordering::Relaxed);
+}
+
+pub fn timer_works() -> bool {
+    TIMER_WORKS.load(Ordering::Relaxed)
 }
 
 pub trait Testable {
