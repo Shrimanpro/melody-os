@@ -1,7 +1,12 @@
 //! IDT, legacy PIC, PIT tick and TSC-based timing.
+//!
+//! Interrupt handlers here never take a lock that the main loop also takes: the timer
+//! handler only bumps a counter and the keyboard handler only pushes raw scancodes into a
+//! lock-free queue. Everything else (UI, audio, network) runs in the main loop.
+
 
 use crate::{gdt, print, println};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use x86_64::instructions::port::Port;
@@ -63,7 +68,7 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 // ---------------------------------------------------------------------------
-// PIT tick (1 kHz)
+// PIT tick (1 kHz) and keyboard queue
 // ---------------------------------------------------------------------------
 
 pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -73,33 +78,55 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     unsafe { PICS.lock().notify_end_of_interrupt(TIMER_VECTOR) };
 }
 
-extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
-    use spin::Mutex;
-    use x86_64::instructions::port::Port;
+const KEY_QUEUE_LEN: usize = 64;
+static KEY_QUEUE: [AtomicU8; KEY_QUEUE_LEN] = [const { AtomicU8::new(0) }; KEY_QUEUE_LEN];
+static KEY_HEAD: AtomicUsize = AtomicUsize::new(0); // written by the ISR
+static KEY_TAIL: AtomicUsize = AtomicUsize::new(0); // written by the main loop
 
-    static KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> = Mutex::new(Keyboard::new(
-        ScancodeSet1::new(),
-        layouts::Us104Key,
-        HandleControl::Ignore,
-    ));
-
-    let mut keyboard = KEYBOARD.lock();
-    let mut port = Port::new(0x60);
-
-    let scancode: u8 = unsafe { port.read() };
-    if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
-        if let Some(key) = keyboard.process_keyevent(key_event) {
-            match key {
-                DecodedKey::Unicode(character) => print!("{}", character),
-                DecodedKey::RawKey(key) => print!("{:?}", key),
-            }
-        }
+fn push_scancode(code: u8) {
+    let head = KEY_HEAD.load(Ordering::Relaxed);
+    let next = (head + 1) % KEY_QUEUE_LEN;
+    if next == KEY_TAIL.load(Ordering::Acquire) {
+        return; // queue full, drop the key
     }
+    KEY_QUEUE[head].store(code, Ordering::Relaxed);
+    KEY_HEAD.store(next, Ordering::Release);
+}
 
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(KEYBOARD_VECTOR);
+/// Pop one raw PS/2 scancode queued by the keyboard interrupt.
+pub fn pop_scancode() -> Option<u8> {
+    let tail = KEY_TAIL.load(Ordering::Relaxed);
+    if tail == KEY_HEAD.load(Ordering::Acquire) {
+        return None;
+    }
+    let code = KEY_QUEUE[tail].load(Ordering::Relaxed);
+    KEY_TAIL.store((tail + 1) % KEY_QUEUE_LEN, Ordering::Release);
+    Some(code)
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let mut status = Port::<u8>::new(0x64);
+    let mut data = Port::<u8>::new(0x60);
+    // Bound the loop: some USB-legacy emulations keep the status bit stuck.
+    for _ in 0..16 {
+        if unsafe { status.read() } & 0x01 == 0 {
+            break;
+        }
+        push_scancode(unsafe { data.read() });
+    }
+    unsafe { PICS.lock().notify_end_of_interrupt(KEYBOARD_VECTOR) };
+}
+
+/// Drain stale bytes from the 8042 output buffer without sending it any commands
+/// (machines with only a USB keyboard may not answer them).
+pub fn flush_ps2_buffer() {
+    let mut status = Port::<u8>::new(0x64);
+    let mut data = Port::<u8>::new(0x60);
+    for _ in 0..16 {
+        if unsafe { status.read() } & 0x01 == 0 {
+            break;
+        }
+        let _ = unsafe { data.read() };
     }
 }
 
@@ -228,4 +255,12 @@ pub fn wait_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
 #[test_case]
 fn test_breakpoint_exception() {
     x86_64::instructions::interrupts::int3();
+}
+#[test_case]
+fn test_scancode_queue_roundtrip() {
+    push_scancode(0x39);
+    push_scancode(0xB9);
+    assert_eq!(pop_scancode(), Some(0x39));
+    assert_eq!(pop_scancode(), Some(0xB9));
+    assert_eq!(pop_scancode(), None);
 }

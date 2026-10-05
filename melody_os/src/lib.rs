@@ -28,6 +28,7 @@ static TIMER_WORKS: AtomicBool = AtomicBool::new(false);
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
+    interrupts::flush_ps2_buffer();
     interrupts::calibrate_tsc();
     unsafe {
         let mut pics = interrupts::PICS.lock();
