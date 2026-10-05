@@ -4,8 +4,7 @@
 //! handler only bumps a counter and the keyboard handler only pushes raw scancodes into a
 //! lock-free queue. Everything else (UI, audio, network) runs in the main loop.
 
-
-use crate::{gdt, print, println};
+use crate::gdt;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
@@ -25,6 +24,8 @@ lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
         idt.breakpoint.set_handler_fn(breakpoint_handler);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        idt.general_protection_fault.set_handler_fn(gpf_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
         unsafe {
             idt.double_fault
@@ -33,6 +34,9 @@ lazy_static! {
         }
         idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt_handler);
+        for i in (PIC_1_OFFSET + 2)..(PIC_2_OFFSET + 8) {
+            idt[i].set_handler_fn(spurious_irq_handler);
+        }
         idt
     };
 }
@@ -41,10 +45,30 @@ pub fn init_idt() {
     IDT.load();
 }
 
-extern "x86-interrupt" fn breakpoint_handler(
-    stack_frame: InterruptStackFrame)
-{
-    println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
+/// Print a fatal error on screen and serial, then stop the CPU for good.
+pub fn fatal(args: core::fmt::Arguments) -> ! {
+    x86_64::instructions::interrupts::disable();
+    crate::vga_buffer::force_print(args);
+    unsafe { crate::serial::SERIAL1.force_unlock() };
+    crate::serial_println!("{}", args);
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    crate::serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    fatal(format_args!("\nFATAL: invalid opcode at {:?}", stack_frame.instruction_pointer));
+}
+
+extern "x86-interrupt" fn gpf_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    fatal(format_args!(
+        "\nFATAL: general protection fault (code {:#x}) at {:?}",
+        error_code, stack_frame.instruction_pointer
+    ));
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -52,19 +76,16 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
-
-    println!("EXCEPTION: PAGE FAULT");
-    println!("Accessed Address: {:?}", Cr2::read());
-    println!("Error Code: {:?}", error_code);
-    println!("{:#?}", stack_frame);
-    loop {}
+    fatal(format_args!(
+        "\nFATAL: page fault accessing {:?} ({:?}) at {:?}",
+        Cr2::read(),
+        error_code,
+        stack_frame.instruction_pointer
+    ));
 }
 
-extern "x86-interrupt" fn double_fault_handler(
-    stack_frame: InterruptStackFrame,
-    _error_code: u64,
-) -> ! {
-    panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _error_code: u64) -> ! {
+    fatal(format_args!("\nFATAL: double fault at {:?}", stack_frame.instruction_pointer));
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +136,14 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         push_scancode(unsafe { data.read() });
     }
     unsafe { PICS.lock().notify_end_of_interrupt(KEYBOARD_VECTOR) };
+}
+
+extern "x86-interrupt" fn spurious_irq_handler(_stack_frame: InterruptStackFrame) {
+    // All other IRQ lines are masked; if one fires anyway, acknowledge both PICs.
+    unsafe {
+        Port::<u8>::new(0xA0).write(0x20);
+        Port::<u8>::new(0x20).write(0x20);
+    }
 }
 
 /// Drain stale bytes from the 8042 output buffer without sending it any commands
@@ -256,6 +285,7 @@ pub fn wait_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
 fn test_breakpoint_exception() {
     x86_64::instructions::interrupts::int3();
 }
+
 #[test_case]
 fn test_scancode_queue_roundtrip() {
     push_scancode(0x39);

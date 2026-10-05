@@ -97,6 +97,10 @@ impl Writer {
 
             }
         }
+    pub fn set_color(&mut self, color: ColorCode) {
+        self.color_code = color;
+    }
+
     fn new_line(&mut self)
     {
         for row in 1..BUFFER_HEIGHT 
@@ -169,6 +173,15 @@ pub fn _print(args: fmt::Arguments) {
     interrupts::without_interrupts(|| {
         WRITER.lock().write_fmt(args).unwrap();
     });
+}
+
+/// Print even if the writer lock is held (used by fault handlers that never return).
+pub fn force_print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    unsafe { WRITER.force_unlock() };
+    let mut w = WRITER.lock();
+    w.set_color(ColorCode::new(Color::White, Color::Red));
+    let _ = w.write_fmt(args);
 }
 
 #[test_case]
