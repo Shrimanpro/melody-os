@@ -15,8 +15,6 @@ use melody_os::{ahci, audio, net, pci, println, serial_println};
 entry_point!(kernel_main);
 
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
-    use melody_os::allocator;
-    use melody_os::memory::{self, BootInfoFrameAllocator};
     use x86_64::VirtAddr;
 
     println!("========================================");
@@ -24,14 +22,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     println!("    Lightweight Audiophile Rust Kernel  ");
     println!("========================================");
 
-    // 1. Initialize core hardware subsystems: GDT, IDT, PICs, interrupts
-    melody_os::init();
-
-    // 2. Initialize Paging and Heap Allocator
+    // 1. GDT, IDT, PICs, timer, paging and heap
+    melody_os::init_with_memory(boot_info);
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
-    let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
-    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
     println!("[OK] Memory & Heap Allocator Initialized");
 
     // 3. Step 1: PCI Bus Enumeration

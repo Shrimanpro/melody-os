@@ -100,10 +100,23 @@ pub fn hlt_loop() -> ! {
     }
 }
 
-#[cfg(test)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+/// Initialise CPU tables, memory and the heap (shared by the kernel and test binaries).
+pub fn init_with_memory(boot_info: &'static bootloader::BootInfo) {
+    use x86_64::VirtAddr;
     init();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    memory::register_frame_allocator(frame_allocator);
+}
+
+#[cfg(test)]
+bootloader::entry_point!(test_kernel_main);
+
+#[cfg(test)]
+fn test_kernel_main(boot_info: &'static bootloader::BootInfo) -> ! {
+    init_with_memory(boot_info);
     test_main();
     hlt_loop();
 }
