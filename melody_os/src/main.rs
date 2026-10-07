@@ -10,6 +10,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use melody_os::vga_buffer::{print_colored, Color};
 use melody_os::{ahci, audio, net, pci, println, serial_println};
 
 entry_point!(kernel_main);
@@ -17,10 +18,7 @@ entry_point!(kernel_main);
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     use x86_64::VirtAddr;
 
-    println!("========================================");
-    println!("          Welcome to Melody OS          ");
-    println!("    Lightweight Audiophile Rust Kernel  ");
-    println!("========================================");
+    print_colored(Color::LightCyan, format_args!("Melody OS {} - booting\n\n", env!("CARGO_PKG_VERSION")));
 
     // 1. GDT, IDT, PICs, timer, paging and heap
     melody_os::init_with_memory(boot_info);
