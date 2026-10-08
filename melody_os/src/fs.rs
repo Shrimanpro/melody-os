@@ -1,17 +1,27 @@
+//! Read-only FAT32/FAT16.
+
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Trait for a generic block storage device that can read 512-byte sectors.
+/// A device that reads 512-byte sectors.
 pub trait BlockDevice {
-    fn read_sector(&mut self, lba: u64, buffer: &mut [u8; 512]) -> Result<(), &'static str>;
-}
+    /// Read `buf.len() / 512` consecutive sectors starting at `lba`.
+    fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), &'static str>;
 
-#[derive(Debug, Clone)]
-pub struct FatDirEntry {
-    pub name: String,
-    pub is_directory: bool,
-    pub size: u32,
-    pub first_cluster: u32,
+    /// Largest read the device handles efficiently in one request.
+    fn max_read_bytes(&self) -> usize {
+        512
+    }
+
+    /// Size of the device in sectors, if known.
+    fn sector_count(&self) -> Option<u64> {
+        None
+    }
+
+    fn read_sector(&mut self, lba: u64, buf: &mut [u8; 512]) -> Result<(), &'static str> {
+        self.read_sectors(lba, buf)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -32,225 +42,210 @@ impl MasterBootRecord {
         if sector[510] != 0x55 || sector[511] != 0xAA {
             return Err("Invalid MBR signature (missing 0x55AA)");
         }
-
         let mut partitions = [None; 4];
-        for i in 0..4 {
-            let offset = 446 + i * 16;
-            let status = sector[offset];
-            let partition_type = sector[offset + 4];
-            let lba_start = u32::from_le_bytes([
-                sector[offset + 8],
-                sector[offset + 9],
-                sector[offset + 10],
-                sector[offset + 11],
-            ]);
-            let sector_count = u32::from_le_bytes([
-                sector[offset + 12],
-                sector[offset + 13],
-                sector[offset + 14],
-                sector[offset + 15],
-            ]);
-
+        for (i, slot) in partitions.iter_mut().enumerate() {
+            let o = 446 + i * 16;
+            let partition_type = sector[o + 4];
+            let lba_start = u32::from_le_bytes([sector[o + 8], sector[o + 9], sector[o + 10], sector[o + 11]]);
+            let sector_count = u32::from_le_bytes([sector[o + 12], sector[o + 13], sector[o + 14], sector[o + 15]]);
             if partition_type != 0 && sector_count > 0 {
-                partitions[i] = Some(PartitionEntry {
-                    status,
-                    partition_type,
-                    lba_start,
-                    sector_count,
-                });
+                *slot = Some(PartitionEntry { status: sector[o], partition_type, lba_start, sector_count });
             }
         }
-
         Ok(MasterBootRecord { partitions })
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Fat32BootSector {
-    pub bytes_per_sector: u16,
-    pub sectors_per_cluster: u8,
-    pub reserved_sectors: u16,
-    pub num_fats: u8,
-    pub sectors_per_fat: u32,
-    pub root_cluster: u32,
+/// Check a boot sector; returns true for FAT32, false for FAT16, or why it can't be used.
+fn classify_boot_sector(s: &[u8; 512]) -> Result<bool, &'static str> {
+    if &s[3..11] == b"EXFAT   " {
+        return Err("exFAT volume (reformat the stick as FAT32)");
+    }
+    if &s[3..11] == b"NTFS    " {
+        return Err("NTFS volume (reformat the stick as FAT32)");
+    }
+    if s[510] != 0x55 || s[511] != 0xAA {
+        return Err("no boot sector signature");
+    }
+    let bps = u16::from_le_bytes([s[11], s[12]]);
+    let spc = s[13] as u64;
+    let reserved = u16::from_le_bytes([s[14], s[15]]) as u64;
+    let num_fats = s[16] as u64;
+    let root_entries = u16::from_le_bytes([s[17], s[18]]) as u64;
+    let fat_size16 = u16::from_le_bytes([s[22], s[23]]) as u64;
+    let fat_size32 = u32::from_le_bytes([s[36], s[37], s[38], s[39]]) as u64;
+    if bps != 512 {
+        return Err("unsupported sector size");
+    }
+    if spc == 0 || !spc.is_power_of_two() || num_fats == 0 || reserved == 0 {
+        return Err("not a FAT volume");
+    }
+    if root_entries == 0 && fat_size16 == 0 && fat_size32 != 0 {
+        return Ok(true);
+    }
+    // FAT12 vs FAT16 is decided by the cluster count (Microsoft FAT spec).
+    let total = match u16::from_le_bytes([s[19], s[20]]) as u64 {
+        0 => u32::from_le_bytes([s[32], s[33], s[34], s[35]]) as u64,
+        n => n,
+    };
+    let data = total.saturating_sub(reserved + num_fats * fat_size16 + (root_entries * 32).div_ceil(512));
+    if data / spc < 4085 {
+        return Err("FAT12 volume (reformat the stick as FAT32)");
+    }
+    Ok(false)
+}
+
+/// A mounted FAT32 (or FAT16) volume.
+pub struct FatVolume {
+    pub fat16: bool,
     pub fat_lba: u64,
     pub data_lba: u64,
+    pub sectors_per_cluster: u32,
+    /// FAT32: first cluster of the root directory. FAT16: 0 (fixed root region).
+    pub root_cluster: u32,
+    root_dir_lba: u64,
+    root_dir_sectors: u64,
+    pub total_sectors: u64,
+    pub label: String,
+    fat_cache_lba: u64,
+    fat_cache: Box<[u8; 512]>,
 }
 
-pub struct Fat32FileSystem<'a, D: BlockDevice> {
-    device: &'a mut D,
-    pub bpb: Fat32BootSector,
-    pub partition_lba: u64,
-}
+impl FatVolume {
+    pub fn mount<D: BlockDevice + ?Sized>(dev: &mut D, partition_lba: u64) -> Result<Self, &'static str> {
+        let mut s = [0u8; 512];
+        dev.read_sector(partition_lba, &mut s)?;
+        let is_fat32 = classify_boot_sector(&s)?;
 
-impl<'a, D: BlockDevice> Fat32FileSystem<'a, D> {
-    pub fn new(device: &'a mut D, partition_lba: u64) -> Result<Self, &'static str> {
-        let mut sector = [0u8; 512];
-        device.read_sector(partition_lba, &mut sector)?;
-
-        if sector[510] != 0x55 || sector[511] != 0xAA {
-            return Err("Invalid FAT32 boot sector signature");
-        }
-
-        let bytes_per_sector = u16::from_le_bytes([sector[11], sector[12]]);
-        if bytes_per_sector != 512 {
-            return Err("Only 512-byte sectors are supported");
-        }
-        let sectors_per_cluster = sector[13];
-        let reserved_sectors = u16::from_le_bytes([sector[14], sector[15]]);
-        let num_fats = sector[16];
-        let sectors_per_fat = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
-        let root_cluster = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]);
-
-        let fat_lba = partition_lba + reserved_sectors as u64;
-        let data_lba = fat_lba + (num_fats as u64) * (sectors_per_fat as u64);
-
-        let bpb = Fat32BootSector {
-            bytes_per_sector,
-            sectors_per_cluster,
-            reserved_sectors,
-            num_fats,
-            sectors_per_fat,
-            root_cluster,
-            fat_lba,
-            data_lba,
+        let spc = s[13] as u32;
+        let reserved = u16::from_le_bytes([s[14], s[15]]) as u64;
+        let num_fats = s[16] as u64;
+        let root_entries = u16::from_le_bytes([s[17], s[18]]) as u64;
+        let total_sectors = match u16::from_le_bytes([s[19], s[20]]) as u64 {
+            0 => u32::from_le_bytes([s[32], s[33], s[34], s[35]]) as u64,
+            n => n,
         };
-
-        Ok(Fat32FileSystem {
-            device,
-            bpb,
-            partition_lba,
+        let fat_lba = partition_lba + reserved;
+        let (fat_size, root_cluster, label_off) = if is_fat32 {
+            (u32::from_le_bytes([s[36], s[37], s[38], s[39]]) as u64, u32::from_le_bytes([s[44], s[45], s[46], s[47]]), 71)
+        } else {
+            (u16::from_le_bytes([s[22], s[23]]) as u64, 0, 43)
+        };
+        if is_fat32 && root_cluster < 2 {
+            return Err("invalid FAT32 root cluster");
+        }
+        let root_dir_lba = fat_lba + num_fats * fat_size;
+        let root_dir_sectors = (root_entries * 32).div_ceil(512);
+        let label = core::str::from_utf8(&s[label_off..label_off + 11]).unwrap_or("").trim().into();
+        Ok(FatVolume {
+            fat16: !is_fat32,
+            fat_lba,
+            data_lba: root_dir_lba + root_dir_sectors,
+            sectors_per_cluster: spc,
+            root_cluster,
+            root_dir_lba,
+            root_dir_sectors,
+            total_sectors,
+            label,
+            fat_cache_lba: u64::MAX,
+            fat_cache: Box::new([0u8; 512]),
         })
     }
 
+    pub fn type_name(&self) -> &'static str {
+        if self.fat16 { "FAT16" } else { "FAT32" }
+    }
+
+    pub fn cluster_bytes(&self) -> usize {
+        self.sectors_per_cluster as usize * 512
+    }
+
     pub fn cluster_to_lba(&self, cluster: u32) -> u64 {
-        self.bpb.data_lba + ((cluster - 2) as u64) * (self.bpb.sectors_per_cluster as u64)
+        self.data_lba + (cluster.saturating_sub(2) as u64) * self.sectors_per_cluster as u64
     }
 
-    pub fn next_cluster(&mut self, current_cluster: u32) -> Result<Option<u32>, &'static str> {
-        let fat_offset = (current_cluster as u64) * 4;
-        let fat_sector_lba = self.bpb.fat_lba + (fat_offset / 512);
-        let sector_offset = (fat_offset % 512) as usize;
-
-        let mut sector = [0u8; 512];
-        self.device.read_sector(fat_sector_lba, &mut sector)?;
-
-        let next = u32::from_le_bytes([
-            sector[sector_offset],
-            sector[sector_offset + 1],
-            sector[sector_offset + 2],
-            sector[sector_offset + 3],
-        ]) & 0x0FFFFFFF;
-
-        if next >= 0x0FFFFFF8 {
-            Ok(None) // End of cluster chain
-        } else if next == 0x0FFFFFF7 {
-            Err("Encountered bad cluster in FAT")
+    pub fn next_cluster<D: BlockDevice + ?Sized>(&mut self, dev: &mut D, cluster: u32) -> Result<Option<u32>, &'static str> {
+        let (entry, eoc, bad) = if self.fat16 { (2u64, 0xFFF8, 0xFFF7) } else { (4u64, 0x0FFF_FFF8, 0x0FFF_FFF7) };
+        if cluster < 2 || cluster >= bad {
+            return Ok(None);
+        }
+        let byte = cluster as u64 * entry;
+        let lba = self.fat_lba + byte / 512;
+        if lba != self.fat_cache_lba {
+            self.fat_cache_lba = u64::MAX;
+            dev.read_sector(lba, &mut self.fat_cache)?;
+            self.fat_cache_lba = lba;
+        }
+        let o = (byte % 512) as usize;
+        let c = &self.fat_cache;
+        let next = if self.fat16 {
+            u16::from_le_bytes([c[o], c[o + 1]]) as u32
         } else {
-            Ok(Some(next))
+            u32::from_le_bytes([c[o], c[o + 1], c[o + 2], c[o + 3]]) & 0x0FFF_FFFF
+        };
+        match next {
+            n if n >= eoc => Ok(None),
+            n if n == bad => Err("bad cluster in FAT chain"),
+            0 | 1 => Err("broken FAT chain"),
+            n => Ok(Some(n)),
         }
     }
+}
 
-    pub fn list_directory(&mut self, dir_cluster: u32) -> Result<Vec<FatDirEntry>, &'static str> {
-        let mut entries = Vec::new();
-        let mut current_cluster = Some(dir_cluster);
-        let mut sector_buf = [0u8; 512];
+/// Find a FAT32/FAT16 volume on a drive: MBR partitions, GPT partitions, or an unpartitioned stick.
+pub fn find_fat_volume<D: BlockDevice + ?Sized>(dev: &mut D) -> Result<FatVolume, &'static str> {
+    let mut sector0 = [0u8; 512];
+    dev.read_sector(0, &mut sector0)?;
 
-        while let Some(cluster) = current_cluster {
-            let start_lba = self.cluster_to_lba(cluster);
-            for s in 0..self.bpb.sectors_per_cluster {
-                self.device.read_sector(start_lba + s as u64, &mut sector_buf)?;
-
-                for entry_idx in 0..(512 / 32) {
-                    let offset = entry_idx * 32;
-                    let first_byte = sector_buf[offset];
-                    if first_byte == 0x00 {
-                        // End of directory entries
-                        return Ok(entries);
+    let mut candidates: Vec<u64> = Vec::new();
+    if let Ok(mbr) = MasterBootRecord::parse(&sector0) {
+        let gpt = mbr.partitions.iter().flatten().any(|p| p.partition_type == 0xEE);
+        if gpt {
+            let mut hdr = [0u8; 512];
+            if dev.read_sector(1, &mut hdr).is_ok() && &hdr[0..8] == b"EFI PART" {
+                let entries_lba = u64::from_le_bytes(hdr[72..80].try_into().unwrap());
+                let count = u32::from_le_bytes(hdr[80..84].try_into().unwrap()).min(128) as usize;
+                let esize = (u32::from_le_bytes(hdr[84..88].try_into().unwrap()) as usize).max(128);
+                let per_sector = 512 / esize;
+                let mut sec = [0u8; 512];
+                for i in 0..count.div_ceil(per_sector.max(1)) {
+                    if dev.read_sector(entries_lba + i as u64, &mut sec).is_err() {
+                        break;
                     }
-                    if first_byte == 0xE5 {
-                        // Deleted entry
-                        continue;
-                    }
-
-                    let attr = sector_buf[offset + 11];
-                    if attr == 0x0F {
-                        // Long filename entry (skip for basic parser)
-                        continue;
-                    }
-
-                    // Format 8.3 filename
-                    let mut name = String::new();
-                    let raw_name = &sector_buf[offset..offset + 8];
-                    let raw_ext = &sector_buf[offset + 8..offset + 11];
-
-                    for &b in raw_name {
-                        if b != b' ' {
-                            name.push(b as char);
+                    for e in sec.chunks_exact(esize) {
+                        if e[0..16].iter().any(|&b| b != 0) {
+                            let start = u64::from_le_bytes(e[32..40].try_into().unwrap());
+                            if start > 0 {
+                                candidates.push(start);
+                            }
                         }
                     }
-                    let mut ext = String::new();
-                    for &b in raw_ext {
-                        if b != b' ' {
-                            ext.push(b as char);
-                        }
-                    }
-                    if !ext.is_empty() {
-                        name.push('.');
-                        name.push_str(&ext);
-                    }
-
-                    let is_directory = (attr & 0x10) != 0;
-                    let cluster_high = u16::from_le_bytes([sector_buf[offset + 20], sector_buf[offset + 21]]) as u32;
-                    let cluster_low = u16::from_le_bytes([sector_buf[offset + 26], sector_buf[offset + 27]]) as u32;
-                    let file_first_cluster = (cluster_high << 16) | cluster_low;
-                    let size = u32::from_le_bytes([
-                        sector_buf[offset + 28],
-                        sector_buf[offset + 29],
-                        sector_buf[offset + 30],
-                        sector_buf[offset + 31],
-                    ]);
-
-                    entries.push(FatDirEntry {
-                        name,
-                        is_directory,
-                        size,
-                        first_cluster: file_first_cluster,
-                    });
                 }
             }
-
-            current_cluster = self.next_cluster(cluster)?;
-        }
-
-        Ok(entries)
-    }
-
-    /// Read an entire file into memory as a vector of bytes.
-    pub fn read_file(&mut self, entry: &FatDirEntry) -> Result<Vec<u8>, &'static str> {
-        let mut data = Vec::with_capacity(entry.size as usize);
-        let mut current_cluster = Some(entry.first_cluster);
-        let mut remaining = entry.size as usize;
-        let mut sector_buf = [0u8; 512];
-
-        while let Some(cluster) = current_cluster {
-            let start_lba = self.cluster_to_lba(cluster);
-            for s in 0..self.bpb.sectors_per_cluster {
-                if remaining == 0 {
-                    break;
+        } else {
+            // A boot sector full of code (like the Melody OS boot stick itself) also ends in
+            // 0x55AA, so only trust entries that look like real partitions.
+            let limit = dev.sector_count().unwrap_or(u64::MAX);
+            for p in mbr.partitions.iter().flatten() {
+                let end = p.lba_start as u64 + p.sector_count as u64;
+                if (p.status == 0x00 || p.status == 0x80) && p.lba_start > 0 && end <= limit {
+                    candidates.push(p.lba_start as u64);
                 }
-                self.device.read_sector(start_lba + s as u64, &mut sector_buf)?;
-                let to_copy = remaining.min(512);
-                data.extend_from_slice(&sector_buf[..to_copy]);
-                remaining -= to_copy;
             }
-
-            if remaining == 0 {
-                break;
-            }
-            current_cluster = self.next_cluster(cluster)?;
         }
-
-        Ok(data)
     }
+    // An unpartitioned ("superfloppy") stick has the FAT boot sector at LBA 0.
+    candidates.push(0);
+
+    // Only pass on errors that tell the user something actionable (wrong filesystem);
+    // anything else just means "this drive has no FAT volume".
+    let mut err = "no FAT32 partition";
+    for lba in candidates {
+        match FatVolume::mount(dev, lba) {
+            Ok(fs) => return Ok(fs),
+            Err(e) if e.contains("reformat") => err = e,
+            Err(_) => {}
+        }
+    }
+    Err(err)
 }

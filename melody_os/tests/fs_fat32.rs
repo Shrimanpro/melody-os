@@ -39,13 +39,12 @@ struct MemoryBlockDevice {
 }
 
 impl BlockDevice for MemoryBlockDevice {
-    fn read_sector(&mut self, lba: u64, buffer: &mut [u8; 512]) -> Result<(), &'static str> {
-        if (lba as usize) < self.data.len() {
-            *buffer = self.data[lba as usize];
-            Ok(())
-        } else {
-            Err("LBA out of bounds")
+    fn read_sectors(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), &'static str> {
+        for (i, chunk) in buffer.chunks_exact_mut(512).enumerate() {
+            let sector = self.data.get(lba as usize + i).ok_or("LBA out of bounds")?;
+            chunk.copy_from_slice(sector);
         }
+        Ok(())
     }
 }
 
