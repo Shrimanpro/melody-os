@@ -35,7 +35,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Locate Storage, Audio, and Network controllers
     let ahci_dev = pci::find_ahci_controller(&pci_devices);
-    let hda_dev = pci::find_hda_controller(&pci_devices);
+    let hda_dev = pci::find_hda_controllers(&pci_devices).into_iter().next();
     let nic_dev = pci::find_network_controller(&pci_devices);
 
     // 4. Step 2 & 3: Storage Driver & File System

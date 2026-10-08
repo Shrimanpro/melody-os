@@ -111,12 +111,42 @@ impl PciDevice {
         unsafe { pci_write_16(self.address.bus, self.address.device, self.address.function, offset, value); }
     }
 
+    pub unsafe fn write_u8(&self, offset: u8, value: u8) {
+        unsafe { pci_write_8(self.address.bus, self.address.device, self.address.function, offset, value); }
+    }
+
     /// Enable Memory Space and Bus Mastering (necessary for DMA).
     pub unsafe fn enable_bus_mastering(&self) {
+        unsafe { self.set_power_d0() };
         let command = unsafe { self.read_u16(0x04) };
         // Bit 0: IO Space, Bit 1: Memory Space, Bit 2: Bus Master
         let new_command = command | 0x0007;
         unsafe { self.write_u16(0x04, new_command) };
+    }
+
+    /// Bring the device to full power (D0) if the BIOS left it in a sleep state.
+    pub unsafe fn set_power_d0(&self) {
+        let status = unsafe { self.read_u16(0x06) };
+        if status & (1 << 4) == 0 {
+            return; // no capability list
+        }
+        let mut ptr = unsafe { self.read_u8(0x34) } & 0xFC;
+        for _ in 0..48 {
+            if ptr < 0x40 {
+                return;
+            }
+            let id = unsafe { self.read_u8(ptr) };
+            if id == 0x01 {
+                let pmcsr = unsafe { self.read_u16(ptr + 4) };
+                if pmcsr & 0x3 != 0 {
+                    unsafe { self.write_u16(ptr + 4, pmcsr & !0x3) };
+                    // D3hot -> D0 needs 10 ms before the device may be touched.
+                    crate::interrupts::delay_ms(10);
+                }
+                return;
+            }
+            ptr = unsafe { self.read_u8(ptr + 1) } & 0xFC;
+        }
     }
 }
 
@@ -179,12 +209,11 @@ pub unsafe fn pci_write_16(bus: u8, device: u8, function: u8, offset: u8, value:
     unsafe { pci_write_32(bus, device, function, offset, new) };
 }
 
-/// Enable Memory Space and Bus Mastering (necessary for DMA).
-pub unsafe fn enable_bus_mastering(bus: u8, device: u8, function: u8) {
-    let command = unsafe { pci_read_16(bus, device, function, 0x04) };
-    // Bit 0: IO Space, Bit 1: Memory Space, Bit 2: Bus Master
-    let new_command = command | 0x0007;
-    unsafe { pci_write_16(bus, device, function, 0x04, new_command) };
+pub unsafe fn pci_write_8(bus: u8, device: u8, function: u8, offset: u8, value: u8) {
+    let shift = (offset & 3) * 8;
+    let old = unsafe { pci_read_32(bus, device, function, offset) };
+    let new = (old & !(0xFF << shift)) | ((value as u32) << shift);
+    unsafe { pci_write_32(bus, device, function, offset, new) };
 }
 
 unsafe fn read_bar(bus: u8, device: u8, function: u8, bar_index: usize) -> (Bar, bool) {
@@ -243,17 +272,22 @@ unsafe fn read_bar(bus: u8, device: u8, function: u8, bar_index: usize) -> (Bar,
 pub fn scan_pci_bus() -> Vec<PciDevice> {
     let mut devices = Vec::new();
 
-    for bus in 0..=255 {
-        for device in 0..32 {
-            let vendor_id = unsafe { pci_read_16(bus, device, 0, 0x00) };
-            if vendor_id == 0xFFFF {
+    let host_bridge_vendor = unsafe { pci_read_16(0, 0, 0, 0x00) };
+    let host_bridge_device = unsafe { pci_read_16(0, 0, 0, 0x02) };
+
+    for bus in 0..=31 {
+        // If bus > 0 and host bridge is valid, check if this bus aliases bus 0
+        if bus > 0 && host_bridge_vendor != 0xFFFF {
+            let b0_vendor = unsafe { pci_read_16(bus, 0, 0, 0x00) };
+            let b0_device = unsafe { pci_read_16(bus, 0, 0, 0x02) };
+            if b0_vendor == host_bridge_vendor && b0_device == host_bridge_device {
+                // Non-existent secondary bus aliased directly to bus 0 by chipset
                 continue;
             }
+        }
 
-            let header_type = unsafe { pci_read_8(bus, device, 0, 0x0E) };
-            let max_functions = if (header_type & 0x80) != 0 { 8 } else { 1 };
-
-            for function in 0..max_functions {
+        for device in 0..32 {
+            for function in 0..8 {
                 let func_vendor_id = unsafe { pci_read_16(bus, device, function, 0x00) };
                 if func_vendor_id == 0xFFFF {
                     continue;
@@ -266,6 +300,19 @@ pub fn scan_pci_bus() -> Vec<PciDevice> {
                 let prog_if = unsafe { pci_read_8(bus, device, function, 0x09) };
                 let revision = unsafe { pci_read_8(bus, device, function, 0x08) };
                 let func_header_type = unsafe { pci_read_8(bus, device, function, 0x0E) } & 0x7F;
+
+                // Check for duplicate device from aliased bus
+                let is_duplicate = devices.iter().any(|d: &PciDevice| {
+                    d.vendor_id == func_vendor_id
+                        && d.device_id == device_id
+                        && d.class == class
+                        && d.subclass == subclass
+                        && d.address.device == device
+                        && d.address.function == function
+                });
+                if is_duplicate {
+                    continue;
+                }
 
                 let mut bars = [Bar::Empty; 6];
                 if func_header_type == 0x00 {
@@ -299,6 +346,7 @@ pub fn scan_pci_bus() -> Vec<PciDevice> {
     devices
 }
 
+/// Find all Intel High Definition Audio controllers (class 04, subclass 03).
 /// Find the SATA AHCI Controller (Class 0x01, Subclass 0x06, ProgIF 0x01)
 pub fn find_ahci_controller(devices: &[PciDevice]) -> Option<PciDevice> {
     devices.iter().find(|d| {
@@ -306,16 +354,20 @@ pub fn find_ahci_controller(devices: &[PciDevice]) -> Option<PciDevice> {
     }).cloned()
 }
 
-/// Find the Intel High Definition Audio (HDA) Controller (Class 0x04, Subclass 0x03)
-pub fn find_hda_controller(devices: &[PciDevice]) -> Option<PciDevice> {
-    devices.iter().find(|d| {
-        d.class == PciClass::Multimedia && d.subclass == 0x03
-    }).cloned()
+pub fn find_hda_controllers(devices: &[PciDevice]) -> Vec<PciDevice> {
+    devices.iter().filter(|d| d.class == PciClass::Multimedia && d.subclass == 0x03).cloned().collect()
 }
 
-/// Find an Ethernet Network Interface Card (Class 0x02, Subclass 0x00)
+/// Find the first Ethernet controller (class 02, subclass 00).
 pub fn find_network_controller(devices: &[PciDevice]) -> Option<PciDevice> {
-    devices.iter().find(|d| {
-        d.class == PciClass::Network && d.subclass == 0x00
-    }).cloned()
+    devices.iter().find(|d| d.class == PciClass::Network && d.subclass == 0x00).cloned()
+}
+
+/// Find USB host controllers by programming interface: 0x00 UHCI, 0x10 OHCI, 0x20 EHCI, 0x30 xHCI.
+pub fn find_usb_controllers(devices: &[PciDevice], prog_if: u8) -> Vec<PciDevice> {
+    devices
+        .iter()
+        .filter(|d| d.class == PciClass::SerialBus && d.subclass == 0x03 && d.prog_if == prog_if)
+        .cloned()
+        .collect()
 }
