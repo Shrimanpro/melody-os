@@ -1,4 +1,4 @@
-//! Read-only FAT32/FAT16.
+//! Read-only FAT32/FAT16 with long file names.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -54,6 +54,14 @@ impl MasterBootRecord {
         }
         Ok(MasterBootRecord { partitions })
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_directory: bool,
+    pub size: u32,
+    pub first_cluster: u32,
 }
 
 /// Check a boot sector; returns true for FAT32, false for FAT16, or why it can't be used.
@@ -190,6 +198,138 @@ impl FatVolume {
             n => Ok(Some(n)),
         }
     }
+
+    /// List a directory, assembling long file names where present.
+    pub fn read_dir<D: BlockDevice + ?Sized>(&mut self, dev: &mut D, dir_cluster: u32) -> Result<Vec<DirEntry>, &'static str> {
+        let mut entries = Vec::new();
+        let mut lfn: [u16; 260] = [0; 260];
+        let mut lfn_len = 0usize;
+        let mut lfn_valid = false;
+        let mut sector = [0u8; 512];
+        let fixed_root = dir_cluster < 2 && self.fat16;
+        let mut cluster = Some(if fixed_root { 0 } else { dir_cluster });
+        let mut guard = 0;
+
+        while let Some(c) = cluster {
+            guard += 1;
+            if guard > 4096 {
+                break;
+            }
+            let (lba, sectors) = if fixed_root {
+                (self.root_dir_lba, self.root_dir_sectors)
+            } else {
+                (self.cluster_to_lba(c), self.sectors_per_cluster as u64)
+            };
+            for s in 0..sectors {
+                dev.read_sector(lba + s, &mut sector)?;
+                for e in sector.chunks_exact(32) {
+                    match e[0] {
+                        0x00 => return Ok(entries),
+                        0xE5 => {
+                            lfn_valid = false;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let attr = e[11];
+                    if attr == 0x0F {
+                        // Long name fragment: 13 UCS-2 chars, stored last-fragment-first.
+                        let seq = (e[0] & 0x1F) as usize;
+                        if seq == 0 || seq > 20 {
+                            lfn_valid = false;
+                            continue;
+                        }
+                        if e[0] & 0x40 != 0 {
+                            lfn = [0; 260];
+                            lfn_len = 0;
+                            lfn_valid = true;
+                        }
+                        let base = (seq - 1) * 13;
+                        let offsets = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+                        for (k, &o) in offsets.iter().enumerate() {
+                            let ch = u16::from_le_bytes([e[o], e[o + 1]]);
+                            if ch == 0x0000 || ch == 0xFFFF || base + k >= 255 {
+                                break;
+                            }
+                            lfn[base + k] = ch;
+                            lfn_len = lfn_len.max(base + k + 1);
+                        }
+                        continue;
+                    }
+                    if attr & 0x08 != 0 {
+                        lfn_valid = false;
+                        continue; // volume label
+                    }
+
+                    let name = if lfn_valid && lfn_len > 0 {
+                        decode_ucs2(&lfn[..lfn_len])
+                    } else {
+                        short_name(e)
+                    };
+                    lfn_valid = false;
+                    // The high cluster word only exists on FAT32 (it's an access-rights field on FAT16).
+                    let hi = if self.fat16 { 0 } else { u16::from_le_bytes([e[20], e[21]]) as u32 };
+                    let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
+                    entries.push(DirEntry {
+                        name,
+                        is_directory: attr & 0x10 != 0,
+                        size: u32::from_le_bytes([e[28], e[29], e[30], e[31]]),
+                        first_cluster: (hi << 16) | lo,
+                    });
+                }
+            }
+            cluster = if fixed_root { None } else { self.next_cluster(dev, c)? };
+        }
+        Ok(entries)
+    }
+}
+
+fn short_name(e: &[u8]) -> String {
+    let lower_base = e[12] & 0x08 != 0;
+    let lower_ext = e[12] & 0x10 != 0;
+    let mut name = String::new();
+    for &b in e[0..8].iter().take_while(|&&b| b != b' ') {
+        name.push(if lower_base { b.to_ascii_lowercase() } else { b } as char);
+    }
+    if e[8] != b' ' {
+        name.push('.');
+        for &b in e[8..11].iter().take_while(|&&b| b != b' ') {
+            name.push(if lower_ext { b.to_ascii_lowercase() } else { b } as char);
+        }
+    }
+    name
+}
+
+/// UCS-2 to a printable string. Non-ASCII characters become their closest ASCII
+/// equivalent where obvious, otherwise '?', because VGA text mode can't show them anyway.
+fn decode_ucs2(chars: &[u16]) -> String {
+    let mut s = String::with_capacity(chars.len());
+    for &c in chars {
+        let ch = match c {
+            0x20..=0x7E => c as u8 as char,
+            0xC0..=0xC5 => 'A',
+            0xE0..=0xE5 => 'a',
+            0xC8..=0xCB => 'E',
+            0xE8..=0xEB => 'e',
+            0xCC..=0xCF => 'I',
+            0xEC..=0xEF => 'i',
+            0xD2..=0xD6 | 0xD8 => 'O',
+            0xF2..=0xF6 | 0xF8 => 'o',
+            0xD9..=0xDC => 'U',
+            0xF9..=0xFC => 'u',
+            0xC7 => 'C',
+            0xE7 => 'c',
+            0xD1 => 'N',
+            0xF1 => 'n',
+            0xDF => 's',
+            0x2018 | 0x2019 => '\'',
+            0x201C | 0x201D => '"',
+            0x2013 | 0x2014 => '-',
+            _ => '?',
+        };
+        s.push(ch);
+    }
+    s
 }
 
 /// Find a FAT32/FAT16 volume on a drive: MBR partitions, GPT partitions, or an unpartitioned stick.
