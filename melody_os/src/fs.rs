@@ -1,4 +1,5 @@
-//! Read-only FAT32/FAT16 with long file names.
+//! Read-only FAT32/FAT16 with long file names and a streaming file reader.
+//! Files are never loaded whole.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -330,6 +331,89 @@ fn decode_ucs2(chars: &[u16]) -> String {
         s.push(ch);
     }
     s
+}
+
+/// Sequential reader over a file's cluster chain.
+pub struct FileReader {
+    first_cluster: u32,
+    pub size: u64,
+    pos: u64,
+    cluster: u32,
+    cluster_index: u64,
+}
+
+impl FileReader {
+    pub fn new(first_cluster: u32, size: u32) -> Self {
+        FileReader { first_cluster, size: size as u64, pos: 0, cluster: first_cluster, cluster_index: 0 }
+    }
+
+    pub fn position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Move to an absolute byte offset. Seeking backwards walks the chain from the start.
+    pub fn seek<D: BlockDevice + ?Sized>(&mut self, fs: &mut FatVolume, dev: &mut D, pos: u64) -> Result<(), &'static str> {
+        let pos = pos.min(self.size);
+        let target = pos / fs.cluster_bytes() as u64;
+        if target < self.cluster_index {
+            self.cluster = self.first_cluster;
+            self.cluster_index = 0;
+        }
+        while self.cluster_index < target {
+            self.cluster = fs.next_cluster(dev, self.cluster)?.ok_or("seek past end of chain")?;
+            self.cluster_index += 1;
+        }
+        self.pos = pos;
+        Ok(())
+    }
+
+    /// Read up to `buf.len()` bytes; returns 0 at end of file.
+    pub fn read<D: BlockDevice + ?Sized>(&mut self, fs: &mut FatVolume, dev: &mut D, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let cbytes = fs.cluster_bytes() as u64;
+        let mut done = 0usize;
+        while done < buf.len() && self.pos < self.size {
+            // Advance to the cluster holding `pos`.
+            while self.pos / cbytes > self.cluster_index {
+                self.cluster = fs.next_cluster(dev, self.cluster)?.ok_or("file shorter than its size")?;
+                self.cluster_index += 1;
+            }
+            let in_cluster = self.pos % cbytes;
+            let file_left = self.size - self.pos;
+            let buf_left = (buf.len() - done) as u64;
+            // Extend the read across physically consecutive clusters so small-cluster
+            // volumes still get large USB transfers.
+            let mut span = cbytes - in_cluster;
+            let mut c = self.cluster;
+            while span < dev.max_read_bytes() as u64 && span < buf_left && span < file_left {
+                match fs.next_cluster(dev, c)? {
+                    Some(n) if n == c + 1 => {
+                        c = n;
+                        span += cbytes;
+                    }
+                    _ => break,
+                }
+            }
+            let want = buf_left.min(span).min(file_left) as usize;
+            let lba = fs.cluster_to_lba(self.cluster) + in_cluster / 512;
+            let in_sector = (in_cluster % 512) as usize;
+
+            if in_sector == 0 && want >= 512 {
+                // Whole sectors straight into the caller's buffer.
+                let bytes = (want / 512 * 512).min(dev.max_read_bytes());
+                dev.read_sectors(lba, &mut buf[done..done + bytes])?;
+                done += bytes;
+                self.pos += bytes as u64;
+            } else {
+                let mut sector = [0u8; 512];
+                dev.read_sector(lba, &mut sector)?;
+                let n = want.min(512 - in_sector);
+                buf[done..done + n].copy_from_slice(&sector[in_sector..in_sector + n]);
+                done += n;
+                self.pos += n as u64;
+            }
+        }
+        Ok(done)
+    }
 }
 
 /// Find a FAT32/FAT16 volume on a drive: MBR partitions, GPT partitions, or an unpartitioned stick.
