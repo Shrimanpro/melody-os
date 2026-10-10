@@ -1,5 +1,5 @@
-//! Read-only FAT32/FAT16 with long file names and a streaming file reader.
-//! Files are never loaded whole.
+//! Read-only FAT32/FAT16 with long file names, plus a music library scanner and a streaming
+//! file reader. Files are never loaded whole: the player pulls data as it needs it.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -414,6 +414,103 @@ impl FileReader {
         }
         Ok(done)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Music library
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioKind {
+    Wav,
+    Flac,
+    Mp3,
+}
+
+impl AudioKind {
+    pub fn from_name(name: &str) -> Option<Self> {
+        let ext = name.rsplit('.').next()?.to_ascii_lowercase();
+        match ext.as_str() {
+            "wav" | "wave" => Some(AudioKind::Wav),
+            "flac" | "fla" => Some(AudioKind::Flac),
+            "mp3" => Some(AudioKind::Mp3),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AudioKind::Wav => "WAV",
+            AudioKind::Flac => "FLAC",
+            AudioKind::Mp3 => "MP3",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Track {
+    /// Path relative to the volume root, e.g. "Artist/Album/01 Song.flac".
+    pub path: String,
+    pub first_cluster: u32,
+    pub size: u32,
+    pub kind: AudioKind,
+}
+
+impl Track {
+    pub fn file_name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+
+    /// File name without extension, for display.
+    pub fn title(&self) -> &str {
+        let name = self.file_name();
+        match name.rfind('.') {
+            Some(i) if i > 0 => &name[..i],
+            _ => name,
+        }
+    }
+}
+
+const MAX_DEPTH: usize = 6;
+const MAX_TRACKS: usize = 4096;
+
+fn skip_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || name.eq_ignore_ascii_case("System Volume Information")
+        || name.eq_ignore_ascii_case("$RECYCLE.BIN")
+        || name.eq_ignore_ascii_case("RECYCLER")
+}
+
+fn scan_dir<D: BlockDevice + ?Sized>(fs: &mut FatVolume, dev: &mut D, cluster: u32, prefix: &str, depth: usize, out: &mut Vec<Track>) {
+    let Ok(entries) = fs.read_dir(dev, cluster) else { return };
+    let mut subdirs = Vec::new();
+    for e in entries {
+        if out.len() >= MAX_TRACKS {
+            return;
+        }
+        if e.is_directory {
+            if !skip_dir(&e.name) && e.first_cluster >= 2 && depth < MAX_DEPTH {
+                subdirs.push(e);
+            }
+        } else if e.first_cluster >= 2 && e.size > 0 && !e.name.starts_with("._") {
+            if let Some(kind) = AudioKind::from_name(&e.name) {
+                out.push(Track { path: alloc::format!("{}{}", prefix, e.name), first_cluster: e.first_cluster, size: e.size, kind });
+            }
+        }
+    }
+    for d in subdirs {
+        let p = alloc::format!("{}{}/", prefix, d.name);
+        scan_dir(fs, dev, d.first_cluster, &p, depth + 1, out);
+    }
+}
+
+/// Walk the whole volume and return every playable file, sorted by path.
+pub fn scan_library<D: BlockDevice + ?Sized>(fs: &mut FatVolume, dev: &mut D) -> Vec<Track> {
+    let mut tracks = Vec::new();
+    let root = fs.root_cluster;
+    scan_dir(fs, dev, root, "", 0, &mut tracks);
+    tracks.sort_by(|a, b| a.path.to_ascii_lowercase().cmp(&b.path.to_ascii_lowercase()));
+    tracks
 }
 
 /// Find a FAT32/FAT16 volume on a drive: MBR partitions, GPT partitions, or an unpartitioned stick.
