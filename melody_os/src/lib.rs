@@ -20,6 +20,7 @@ pub mod memory;
 pub mod net;
 pub mod pci;
 pub mod serial;
+pub mod usb;
 pub mod vga_buffer;
 
 /// Set once we've seen the PIT tick; only then is it safe to `hlt` in the main loop.
