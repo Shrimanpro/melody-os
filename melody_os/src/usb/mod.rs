@@ -24,5 +24,8 @@ pub fn scan(pci_devices: &[PciDevice]) -> Vec<UsbStorageDrive> {
         }
     }
 
+    for dev in pci::find_usb_controllers(pci_devices, 0x30) {
+        println!("       xHCI controller at {} (USB 3.0, not supported - use a USB 2.0 port)", dev.address);
+    }
     drives
 }
