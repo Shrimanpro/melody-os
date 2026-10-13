@@ -1,5 +1,5 @@
 //! USB Mass Storage, Bulk-Only Transport (BOT) with SCSI commands.
-//! Host controllers plug in through the `BulkTransport` trait.
+//! Shared by the EHCI and UHCI drivers through the `BulkTransport` trait.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -7,14 +7,17 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use crate::fs::BlockDevice;
 use super::ehci::EhciController;
+use super::uhci::UhciController;
 
 lazy_static! {
     pub static ref EHCI_CONTROLLERS: Mutex<Vec<EhciController>> = Mutex::new(Vec::new());
+    pub static ref UHCI_CONTROLLERS: Mutex<Vec<UhciController>> = Mutex::new(Vec::new());
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum UsbControllerRef {
     Ehci(usize),
+    Uhci(usize),
 }
 
 /// A USB flash drive / card reader / external disk.
@@ -208,6 +211,11 @@ impl UsbStorageDrive {
                 let c = ctrls.get_mut(idx).ok_or("EHCI controller missing")?;
                 c.read_sectors_msc(self, lba, buf)
             }
+            UsbControllerRef::Uhci(idx) => {
+                let mut ctrls = UHCI_CONTROLLERS.lock();
+                let c = ctrls.get_mut(idx).ok_or("UHCI controller missing")?;
+                c.read_sectors_msc(self, lba, buf)
+            }
         }
     }
 }
@@ -243,6 +251,7 @@ impl BlockDevice for UsbStorageDrive {
         }
         match self.controller_ref {
             UsbControllerRef::Ehci(_) => super::ehci::BOUNCE_SIZE,
+            UsbControllerRef::Uhci(_) => 4096,
         }
     }
 }
