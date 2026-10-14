@@ -16,6 +16,7 @@ pub mod audio;
 pub mod fs;
 pub mod gdt;
 pub mod interrupts;
+pub mod keyboard;
 pub mod memory;
 pub mod net;
 pub mod pci;
