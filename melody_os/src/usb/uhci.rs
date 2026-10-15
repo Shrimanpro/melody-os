@@ -1,5 +1,5 @@
 //! USB 1.1 UHCI host controller (the companion of EHCI on Intel ICH chipsets).
-//! Used for full/low-speed devices such as the odd USB 1.1 flash drive.
+//! Used for full/low-speed devices: USB keyboards and the odd USB 1.1 flash drive.
 
 use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
@@ -340,7 +340,23 @@ impl UhciController {
         Err(last_err)
     }
 
-    /// Enumerate the two root ports and return mass storage drives.
+    /// Poll a boot-protocol keyboard's interrupt endpoint once (non-blocking: gives up on NAK).
+    pub fn poll_hid_keyboard_report(&mut self, kbd: &mut super::UsbKeyboard, report: &mut [u8; 8]) -> bool {
+        let ls = if kbd.low_speed { TD_LOW_SPEED } else { 0 };
+        let bounce_phys = self.dma.phys_at(BOUNCE) as u32;
+        self.fill_td(0, true, ls | TD_SPD, PID_IN, kbd.dev_addr, kbd.ep_in, kbd.toggle, 8, bounce_phys);
+        match self.run_tds(QH_BULK, 1, 3, true) {
+            Ok(n) if n > 0 => {
+                kbd.toggle ^= 1;
+                report.fill(0);
+                report[..n.min(8)].copy_from_slice(&self.bounce()[..n.min(8)]);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Enumerate the two root ports: register keyboards, return mass storage drives.
     pub fn scan_devices(&mut self, controller_idx: usize, next_addr: &mut u8, name: &str) -> Vec<UsbStorageDrive> {
         let mut drives = Vec::new();
         for port in 0..2 {
@@ -389,6 +405,16 @@ impl UhciController {
             }
             let config_value = conf[5] as u16;
 
+            if let Some((intf, ep_in)) = find_boot_keyboard(&conf) {
+                let _ = self.control_transfer(dev_addr, low_speed, mps, 0x00, 0x09, config_value, 0, &mut []);
+                delay_ms(10);
+                let _ = self.control_transfer(dev_addr, low_speed, mps, 0x21, 0x0B, 0, intf as u16, &mut []); // SET_PROTOCOL(boot)
+                let _ = self.control_transfer(dev_addr, low_speed, mps, 0x21, 0x0A, 0, intf as u16, &mut []); // SET_IDLE(0)
+                println!("       UHCI {} port {}: USB keyboard", name, port + 1);
+                super::register_usb_keyboard(controller_idx, dev_addr, low_speed, ep_in);
+                continue;
+            }
+
             let Some(ep) = msc::parse_msc_endpoints(&conf) else {
                 println!("       UHCI {} port {}: unsupported device", name, port + 1);
                 continue;
@@ -419,6 +445,34 @@ impl UhciController {
         }
         drives
     }
+}
+
+/// Find a HID boot keyboard interface; returns (interface number, interrupt IN endpoint).
+fn find_boot_keyboard(conf: &[u8]) -> Option<(u8, u8)> {
+    let mut i = 0;
+    let mut kbd_intf: Option<u8> = None;
+    while i + 2 <= conf.len() {
+        let len = conf[i] as usize;
+        if len < 2 || i + len > conf.len() {
+            break;
+        }
+        match conf[i + 1] {
+            0x04 if len >= 9 => {
+                let (class, sub, proto) = (conf[i + 5], conf[i + 6], conf[i + 7]);
+                kbd_intf = if class == 0x03 && sub == 0x01 && proto == 0x01 { Some(conf[i + 2]) } else { None };
+            }
+            0x05 if len >= 7 => {
+                if let Some(intf) = kbd_intf {
+                    if conf[i + 2] & 0x80 != 0 && conf[i + 3] & 0x03 == 0x03 {
+                        return Some((intf, conf[i + 2] & 0x0F));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    None
 }
 
 impl msc::BulkTransport for UhciController {

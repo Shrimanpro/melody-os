@@ -1,4 +1,4 @@
-//! Turns raw input (PS/2 scancodes, serial bytes) into player commands.
+//! Turns raw input (PS/2 scancodes, USB HID usages, serial bytes) into player commands.
 
 /// A user command, independent of where the key press came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +67,28 @@ impl Ps2Decoder {
             0x50 => Some(Key::Down),
             _ => None,
         }
+    }
+}
+
+/// Map a USB HID keyboard usage ID (boot protocol) to a command.
+pub fn from_usb_usage(usage: u8) -> Option<Key> {
+    match usage {
+        0x2C => Some(Key::PlayPause),       // Space
+        0x28 | 0x58 => Some(Key::Enter),    // Enter / keypad Enter
+        0x11 | 0x4F => Some(Key::Next),     // N / Right
+        0x13 | 0x50 => Some(Key::Prev),     // P / Left
+        0x52 => Some(Key::Up),
+        0x51 => Some(Key::Down),
+        0x4B => Some(Key::PageUp),
+        0x4E => Some(Key::PageDown),
+        0x16 => Some(Key::Stop),            // S
+        0x2E | 0x57 => Some(Key::VolUp),    // = / keypad +
+        0x2D | 0x56 => Some(Key::VolDown),  // - / keypad -
+        0x10 => Some(Key::Mute),            // M
+        0x12 => Some(Key::Output),          // O
+        0x07 => Some(Key::Diagnostics),     // D
+        0x0F => Some(Key::BootLog),         // L
+        _ => None,
     }
 }
 
