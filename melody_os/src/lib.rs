@@ -10,7 +10,6 @@ extern crate alloc;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-pub mod ahci;
 pub mod allocator;
 pub mod audio;
 pub mod fs;

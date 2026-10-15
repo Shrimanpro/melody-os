@@ -11,7 +11,7 @@ use alloc::vec;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 use melody_os::vga_buffer::{print_colored, Color};
-use melody_os::{ahci, audio, net, pci, println, serial_println};
+use melody_os::{audio, fs, net, pci, println, serial_println, usb};
 
 entry_point!(kernel_main);
 
@@ -33,27 +33,31 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         serial_println!("PCI: {}", dev);
     }
 
-    // Locate Storage, Audio, and Network controllers
-    let ahci_dev = pci::find_ahci_controller(&pci_devices);
+    // Locate Audio and Network controllers
     let hda_dev = pci::find_hda_controllers(&pci_devices).into_iter().next();
     let nic_dev = pci::find_network_controller(&pci_devices);
 
-    // 4. Step 2 & 3: Storage Driver & File System
-    println!("\n[2/5] Initializing Storage (AHCI / SATA)...");
-    if let Some(ref dev) = ahci_dev {
-        println!("Found SATA AHCI Controller at {}", dev.address);
-        match unsafe { ahci::AhciController::new(dev, phys_mem_offset) } {
-            Ok(controller) => {
-                println!("[OK] AHCI initialized with {} active SATA drive(s)", controller.active_ports.len());
-            }
-            Err(e) => println!("[WARN] AHCI init error: {}", e),
-        }
-    } else {
-        println!("[INFO] No AHCI controller found (running in standard emulated IDE or USB mode)");
-    }
+    // 4. Step 2 & 3: USB storage and the music library
+    println!("\n[2/5] USB controllers and drives...");
+    let drives = usb::scan(&pci_devices);
+    println!("[OK] {} USB storage drive(s)", drives.len());
 
-    println!("\n[3/5] Initializing File System (FAT32 / MBR)...");
-    println!("[OK] File System Parser ready for storage volumes");
+    println!("\n[3/5] Music library (FAT32 / FAT16)...");
+    let mut found = false;
+    for mut drive in drives {
+        match fs::find_fat_volume(&mut drive) {
+            Ok(mut fat) => {
+                let tracks = fs::scan_library(&mut fat, &mut drive);
+                println!("[OK] {} tracks on {} ({})", tracks.len(), drive.model, fat.type_name());
+                found = true;
+                break;
+            }
+            Err(e) => println!("[WARN] {}: {}", drive.model, e),
+        }
+    }
+    if !found {
+        println!("[WARN] no music found (put .wav/.flac/.mp3 files on a FAT32 USB stick)");
+    }
 
     // 5. Step 4: Intel HDA Audio Driver & S/PDIF Output
     println!("\n[4/5] Initializing Audio (Intel HDA / S/PDIF)...");
