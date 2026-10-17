@@ -59,42 +59,18 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         println!("[WARN] no music found (put .wav/.flac/.mp3 files on a FAT32 USB stick)");
     }
 
-    // 5. Step 4: Intel HDA Audio Driver & S/PDIF Output
-    println!("\n[4/5] Initializing Audio (Intel HDA / S/PDIF)...");
+    // 5. Step 4: Intel HDA sound
+    println!("\n[4/5] Sound (Intel HDA)...");
     if let Some(ref dev) = hda_dev {
-        println!("Found Intel HDA Audio Controller at {}", dev.address);
-        match unsafe { audio::hda::HdaController::new(dev, phys_mem_offset) } {
-            Ok(mut hda) => {
-                println!("[OK] Intel HDA initialized. S/PDIF optical pin activated!");
-
-                // Generate a startup tone (440 Hz A4 sine wave, 44.1kHz, 16-bit stereo)
-                let sample_rate = 44100u32;
-                let num_samples = 44100 * 2; // 2 seconds
-                let mut wav_bytes = vec![0u8; 44 + num_samples as usize * 4];
-
-                // Write 44-byte RIFF WAV header
-                wav_bytes[0..4].copy_from_slice(b"RIFF");
-                wav_bytes[4..8].copy_from_slice(&((36 + num_samples * 4) as u32).to_le_bytes());
-                wav_bytes[8..12].copy_from_slice(b"WAVE");
-                wav_bytes[12..16].copy_from_slice(b"fmt ");
-                wav_bytes[16..20].copy_from_slice(&16u32.to_le_bytes());
-                wav_bytes[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
-                wav_bytes[22..24].copy_from_slice(&2u16.to_le_bytes()); // Stereo
-                wav_bytes[24..28].copy_from_slice(&sample_rate.to_le_bytes());
-                wav_bytes[28..32].copy_from_slice(&(sample_rate * 4).to_le_bytes()); // Byte rate
-                wav_bytes[32..34].copy_from_slice(&4u16.to_le_bytes()); // Block align
-                wav_bytes[34..36].copy_from_slice(&16u16.to_le_bytes()); // 16 bits
-                wav_bytes[36..40].copy_from_slice(b"data");
-                wav_bytes[40..44].copy_from_slice(&((num_samples * 4) as u32).to_le_bytes());
-
-                if let Ok(wav) = audio::wav::WavAudio::parse(&wav_bytes) {
-                    let _ = hda.play_wav(&wav);
-                }
+        match unsafe { audio::hda::HdaController::new(dev) } {
+            Ok(hda) => {
+                let outs: alloc::vec::Vec<&str> = hda.available_outputs().iter().map(|o| o.name()).collect();
+                println!("[OK] HDA at {}: {} ({})", dev.address, outs.join(", "), hda.active_pins());
             }
-            Err(e) => println!("[WARN] HDA init error: {}", e),
+            Err(e) => println!("[WARN] HDA at {}: {}", dev.address, e),
         }
     } else {
-        println!("[INFO] No Intel HDA device found (attach with -device intel-hda)");
+        println!("[WARN] no HD Audio controller found");
     }
 
     // 6. Step 5: Network Driver & MPD Protocol Server

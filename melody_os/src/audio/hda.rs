@@ -1,283 +1,597 @@
-use volatile::Volatile;
-use x86_64::VirtAddr;
+//! Intel High Definition Audio controller + codec driver.
+//!
+//! - Codecs are walked properly: every output pin is classified from its configuration
+//!   default (analog line-out/headphone/speaker vs. digital S/PDIF/HDMI) and a path back
+//!   to a DAC is found through the connection lists. Only the selected output's paths are
+//!   enabled.
 
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use crate::memory::DmaRegion;
 use crate::pci::{Bar, PciDevice};
-use crate::audio::wav::WavAudio;
 
-pub const HDA_GCTL_CRST: u32 = 1 << 0; // Controller Reset
-pub const HDA_SDCTL_SRST: u16 = 1 << 0; // Stream Reset
-pub const HDA_SDCTL_SRUN: u16 = 1 << 1; // Stream Run
-pub const HDA_SDCTL_IOCE: u16 = 1 << 2; // Interrupt on Completion Enable
+const RING_PAGES: usize = 128;
+pub const RING_BYTES: usize = RING_PAGES * 4096;
+const STREAM_TAG: u32 = 1;
 
-pub const HDA_ICS_ICB: u16 = 1 << 0; // Immediate Command Busy
-pub const HDA_ICS_IRV: u16 = 1 << 1; // Immediate Result Valid
+// Global registers
+const GCAP: usize = 0x00;
+const GCTL: usize = 0x08;
+const STATESTS: usize = 0x0E;
+const INTCTL: usize = 0x20;
+const CORBCTL: usize = 0x4C;
+const RIRBCTL: usize = 0x5C;
+const ICW: usize = 0x60;
+const IRR: usize = 0x64;
+const ICS: usize = 0x68;
 
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-pub struct HdaBdle {
-    pub addr_low: u32,
-    pub addr_high: u32,
-    pub length: u32,
-    pub flags: u32, // Bit 0: Interrupt on Completion
+// Stream descriptor registers (offsets from the descriptor base)
+const SD_CTL: usize = 0x00;
+const SD_LPIB: usize = 0x04;
+const SD_CBL: usize = 0x08;
+const SD_LVI: usize = 0x0C;
+const SD_FMT: usize = 0x12;
+const SD_BDPL: usize = 0x18;
+const SD_BDPU: usize = 0x1C;
+
+const SD_CTL_SRST: u32 = 1 << 0;
+const SD_CTL_RUN: u32 = 1 << 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    Analog,
+    Digital,
 }
 
-#[repr(C)]
-pub struct HdaStreamRegs {
-    pub ctl_low: Volatile<u16>,
-    pub ctl_high: Volatile<u8>,
-    pub sts: Volatile<u8>,
-    pub lpib: Volatile<u32>,
-    pub cbl: Volatile<u32>,
-    pub lvi: Volatile<u16>,
-    pub fifow: Volatile<u16>,
-    pub fifos: Volatile<u16>,
-    pub fmt: Volatile<u16>,
-    pub bdlpl: Volatile<u32>,
-    pub bdlpu: Volatile<u32>,
+impl OutputKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            OutputKind::Analog => "Analog (3.5mm)",
+            OutputKind::Digital => "Digital (S/PDIF/HDMI)",
+        }
+    }
 }
 
-#[allow(dead_code)]
+/// PCM format actually programmed into the stream and converters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcmFormat {
+    pub rate: u32,
+    /// 16, or 24 (sent in a 32-bit container, MSB aligned)
+    pub bits: u8,
+}
+
+impl PcmFormat {
+    pub fn frame_bytes(&self) -> usize {
+        if self.bits == 16 { 4 } else { 8 }
+    }
+
+    /// Encode as the 16-bit HDA stream format word (always stereo).
+    fn to_hda(&self) -> Option<u16> {
+        let (base44, mult, div) = match self.rate {
+            8000 => (false, 1, 6),
+            11025 => (true, 1, 4),
+            16000 => (false, 1, 3),
+            22050 => (true, 1, 2),
+            32000 => (false, 2, 3),
+            44100 => (true, 1, 1),
+            48000 => (false, 1, 1),
+            88200 => (true, 2, 1),
+            96000 => (false, 2, 1),
+            176400 => (true, 4, 1),
+            192000 => (false, 4, 1),
+            _ => return None,
+        };
+        let bits = match self.bits {
+            16 => 0b001,
+            24 => 0b011,
+            _ => return None,
+        };
+        Some(((base44 as u16) << 14) | ((mult - 1) << 11) | ((div - 1) << 8) | (bits << 4) | 1)
+    }
+}
+
+#[derive(Clone)]
+struct Widget {
+    nid: u8,
+    wtype: u8,
+    caps: u32,
+    conns: Vec<u8>,
+    pin_cfg: u32,
+    pin_caps: u32,
+    out_amp: u32,
+    in_amp: u32,
+}
+
+/// A route from an output pin back to a DAC: nids[0] is the pin, the last is the DAC.
+/// `sel[i]` is the connection index nids[i] uses to reach nids[i + 1].
+#[derive(Clone)]
+pub struct OutputPath {
+    pub kind: OutputKind,
+    pub device: &'static str,
+    nids: Vec<u8>,
+    sel: Vec<u8>,
+    headphone: bool,
+}
+
+impl OutputPath {
+    pub fn pin(&self) -> u8 {
+        self.nids[0]
+    }
+    pub fn dac(&self) -> u8 {
+        *self.nids.last().unwrap()
+    }
+}
+
+struct Codec {
+    addr: u8,
+    vendor_id: u32,
+    afg: u8,
+    widgets: Vec<Widget>,
+    paths: Vec<OutputPath>,
+}
+
+impl Codec {
+    fn widget(&self, nid: u8) -> Option<&Widget> {
+        self.widgets.iter().find(|w| w.nid == nid)
+    }
+}
+
 pub struct HdaController {
-    base_virt: *mut u8,
-    phys_mem_offset: VirtAddr,
-    output_stream_offset: usize,
-    bdl_phys: u64,
-    bdl_virt: *mut HdaBdle,
-    buffer_phys: [u64; 2],
-    buffer_virt: [*mut u8; 2],
-    pub buffer_size: usize,
-    pub is_playing: bool,
+    base: *mut u8,
+    sd: usize,
+    bdl: DmaRegion,
+    ring: DmaRegion,
+    codecs: Vec<Codec>,
+    pub vendor_device: (u16, u16),
+    active: Option<OutputKind>,
+    format: Option<PcmFormat>,
+    running: bool,
+    // Ring bookkeeping
+    write_pos: usize,
+    last_lpib: usize,
+    ahead: isize,
+    /// What is queued ahead of the hardware, oldest first: (bytes, is_silence).
+    segments: VecDeque<(usize, bool)>,
+    pub underruns: u32,
+    volume: u8,
+    muted: bool,
 }
+
+unsafe impl Send for HdaController {}
 
 impl HdaController {
-    pub unsafe fn new(pci_dev: &PciDevice, phys_mem_offset: VirtAddr) -> Result<Self, &'static str> {
-        // Enable Bus Mastering and Memory Space on the HDA device
-        unsafe { pci_dev.enable_bus_mastering() };
+    fn r16(&self, off: usize) -> u16 { unsafe { core::ptr::read_volatile(self.base.add(off) as *const u16) } }
+    fn r32(&self, off: usize) -> u32 { unsafe { core::ptr::read_volatile(self.base.add(off) as *const u32) } }
+    fn w8(&self, off: usize, v: u8) { unsafe { core::ptr::write_volatile(self.base.add(off), v) } }
+    fn w16(&self, off: usize, v: u16) { unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u16, v) } }
+    fn w32(&self, off: usize, v: u32) { unsafe { core::ptr::write_volatile(self.base.add(off) as *mut u32, v) } }
 
-        let hdbar_phys = match pci_dev.bars[0] {
+    pub unsafe fn new(pci_dev: &PciDevice) -> Result<Self, &'static str> {
+        unsafe {
+            pci_dev.enable_bus_mastering();
+            if pci_dev.vendor_id == 0x8086 {
+                // Traffic class 0 and snooped DMA (ICH/PCH specific registers).
+                let tcsel = pci_dev.read_u8(0x44);
+                pci_dev.write_u8(0x44, tcsel & !0x07);
+                let devc = pci_dev.read_u16(0x78);
+                if devc != 0xFFFF {
+                    pci_dev.write_u16(0x78, devc & !(1 << 11));
+                }
+            }
+        }
+
+        let bar = match pci_dev.bars[0] {
             Bar::Memory32 { address, .. } => address as u64,
             Bar::Memory64 { address, .. } => address,
             _ => return Err("HDA BAR0 is not a memory BAR"),
         };
+        let base = crate::memory::ensure_mmio_mapped(bar, 16384).as_mut_ptr::<u8>();
 
-        let base_virt = (phys_mem_offset + hdbar_phys).as_mut_ptr::<u8>();
+        let bdl = crate::memory::alloc_dma(1)?;
+        let ring = crate::memory::alloc_dma(RING_PAGES)?;
 
-        // 1. Reset controller
-        unsafe {
-            let gctl_ptr = base_virt.add(0x08) as *mut u32;
-            let mut gctl = core::ptr::read_volatile(gctl_ptr);
-
-            // Clear CRST to reset
-            gctl &= !HDA_GCTL_CRST;
-            core::ptr::write_volatile(gctl_ptr, gctl);
-
-            let mut timeout = 0;
-            while (core::ptr::read_volatile(gctl_ptr) & HDA_GCTL_CRST) != 0 && timeout < 100_000 {
-                timeout += 1;
-            }
-
-            // Set CRST to exit reset
-            gctl |= HDA_GCTL_CRST;
-            core::ptr::write_volatile(gctl_ptr, gctl);
-
-            timeout = 0;
-            while (core::ptr::read_volatile(gctl_ptr) & HDA_GCTL_CRST) == 0 && timeout < 100_000 {
-                timeout += 1;
-            }
-        }
-
-        // Wait a moment for codecs to self-initialize and report state
-        let statests = unsafe { core::ptr::read_volatile(base_virt.add(0x0E) as *const u16) };
-        crate::println!("HDA: Codecs detected (STATESTS): 0x{:04x}", statests);
-
-        // 2. Discover stream counts
-        let gcap = unsafe { core::ptr::read_volatile(base_virt as *const u16) };
-        let iss = ((gcap >> 8) & 0x0F) as usize; // Number of input streams
-        let oss = ((gcap >> 12) & 0x0F) as usize; // Number of output streams
-        crate::println!("HDA: Streams: {} input, {} output", iss, oss);
-
-        if oss == 0 {
-            return Err("HDA controller has no output streams");
-        }
-
-        // Output streams begin after input streams: offset = 0x80 + iss * 0x20
-        let output_stream_offset = 0x80 + iss * 0x20;
-
-        // 3. Allocate DMA buffers:
-        // BDL (Buffer Descriptor List): 2 entries of 16 bytes = 32 bytes (128-byte aligned)
-        let phys_offset = phys_mem_offset.as_u64();
-        let bdl_buf = alloc::vec![0u8; 128].leak();
-        let bdl_virt = bdl_buf.as_mut_ptr() as *mut HdaBdle;
-        let bdl_phys = if (bdl_virt as u64) >= phys_offset { (bdl_virt as u64) - phys_offset } else { bdl_virt as u64 };
-
-        // Double-buffered DMA ring: 2 x 32 KiB buffers
-        let buf_size = 32 * 1024;
-        let buf0 = alloc::vec![0u8; buf_size].leak();
-        let buf1 = alloc::vec![0u8; buf_size].leak();
-
-        let buf0_virt = buf0.as_mut_ptr();
-        let buf1_virt = buf1.as_mut_ptr();
-
-        let buf0_phys = if (buf0_virt as u64) >= phys_offset { (buf0_virt as u64) - phys_offset } else { buf0_virt as u64 };
-        let buf1_phys = if (buf1_virt as u64) >= phys_offset { (buf1_virt as u64) - phys_offset } else { buf1_virt as u64 };
-
-        unsafe {
-            let bdles = core::slice::from_raw_parts_mut(bdl_virt, 2);
-            bdles[0] = HdaBdle {
-                addr_low: (buf0_phys & 0xFFFFFFFF) as u32,
-                addr_high: ((buf0_phys >> 32) & 0xFFFFFFFF) as u32,
-                length: buf_size as u32,
-                flags: 1, // Interrupt on completion
-            };
-            bdles[1] = HdaBdle {
-                addr_low: (buf1_phys & 0xFFFFFFFF) as u32,
-                addr_high: ((buf1_phys >> 32) & 0xFFFFFFFF) as u32,
-                length: buf_size as u32,
-                flags: 1, // Interrupt on completion
-            };
-        }
-
-        let mut controller = HdaController {
-            base_virt,
-            phys_mem_offset,
-            output_stream_offset,
-            bdl_phys,
-            bdl_virt,
-            buffer_phys: [buf0_phys, buf1_phys],
-            buffer_virt: [buf0_virt, buf1_virt],
-            buffer_size: buf_size,
-            is_playing: false,
+        let mut hda = HdaController {
+            base,
+            sd: 0,
+            bdl,
+            ring,
+            codecs: Vec::new(),
+            vendor_device: (pci_dev.vendor_id, pci_dev.device_id),
+            active: None,
+            format: None,
+            running: false,
+            write_pos: 0,
+            last_lpib: 0,
+            ahead: 0,
+            segments: VecDeque::new(),
+            underruns: 0,
+            volume: 80,
+            muted: false,
         };
 
-        // 4. Configure S/PDIF and Line Out codecs
-        controller.configure_codecs();
-
-        Ok(controller)
-    }
-
-    /// Send an Immediate Command to the codec and wait for response
-    pub fn send_verb(&self, codec: u8, nid: u8, verb: u32, payload: u32) -> u32 {
-        let command = ((codec as u32 & 0x0F) << 28)
-            | ((nid as u32 & 0xFF) << 20)
-            | ((verb & 0xFFF) << 8)
-            | (payload & 0xFF);
-
-        unsafe {
-            let icw = self.base_virt.add(0x60) as *mut u32;
-            let irr = self.base_virt.add(0x64) as *const u32;
-            let ics = self.base_virt.add(0x68) as *mut u16;
-
-            // Wait until Immediate Command is not busy
-            let mut timeout = 0;
-            while (core::ptr::read_volatile(ics) & HDA_ICS_ICB) != 0 && timeout < 100_000 {
-                timeout += 1;
-            }
-
-            // Write command
-            core::ptr::write_volatile(icw, command);
-
-            // Trigger command (set ICB and clear IRV)
-            core::ptr::write_volatile(ics, HDA_ICS_ICB | HDA_ICS_IRV);
-
-            // Wait for response (IRV set, ICB clear)
-            timeout = 0;
-            while ((core::ptr::read_volatile(ics) & HDA_ICS_ICB) != 0
-                || (core::ptr::read_volatile(ics) & HDA_ICS_IRV) == 0)
-                && timeout < 100_000
-            {
-                timeout += 1;
-            }
-
-            core::ptr::read_volatile(irr)
+        // Controller reset: CRST 0 -> 1.
+        hda.w8(CORBCTL, 0);
+        hda.w8(RIRBCTL, 0);
+        hda.w32(GCTL, hda.r32(GCTL) & !1);
+        if !crate::interrupts::wait_until(100, || hda.r32(GCTL) & 1 == 0) {
+            return Err("controller did not enter reset");
         }
-    }
-
-    /// Configure codec widgets for Line Out and digital S/PDIF optical output
-    pub fn configure_codecs(&mut self) {
-        crate::println!("HDA: Initializing audio codec and activating S/PDIF & Line Out...");
-
-        for nid in 2..=16 {
-            // Unmute amplifiers on audio nodes
-            self.send_verb(0, nid, 0x3, 0xB07F); // Output amp: unmute, max volume
-            self.send_verb(0, nid, 0x705, 0x00); // Power state: D0 (active)
-            self.send_verb(0, nid, 0x707, 0x45); // Pin widget control: enable output + vref
-            self.send_verb(0, nid, 0x70D, 0x01); // S/PDIF digital output enable
-            self.send_verb(0, nid, 0x706, 0x10); // Assign to Stream ID 1, channel 0
+        crate::interrupts::delay_us(200);
+        hda.w32(GCTL, hda.r32(GCTL) | 1);
+        if !crate::interrupts::wait_until(100, || hda.r32(GCTL) & 1 == 1) {
+            return Err("controller did not leave reset");
         }
+        hda.w32(INTCTL, 0);
+        // Codecs need up to 521 us after reset to request a state change.
+        crate::interrupts::delay_ms(2);
+        let mut statests = 0;
+        crate::interrupts::wait_until(50, || {
+            statests = hda.r16(STATESTS);
+            statests != 0
+        });
+        if statests == 0 {
+            return Err("no codecs responded");
+        }
+
+        let gcap = hda.r16(GCAP);
+        let iss = ((gcap >> 8) & 0x0F) as usize;
+        let oss = ((gcap >> 12) & 0x0F) as usize;
+        if oss == 0 {
+            return Err("no output streams");
+        }
+        hda.sd = 0x80 + iss * 0x20;
+
+        // BDL: one entry per 4 KiB page of the ring.
+        for i in 0..RING_PAGES {
+            let e = hda.bdl.ptr_at::<u32>(i * 16);
+            let phys = hda.ring.phys_at(i * 4096);
+            unsafe {
+                e.write_volatile(phys as u32);
+                e.add(1).write_volatile((phys >> 32) as u32);
+                e.add(2).write_volatile(4096);
+                e.add(3).write_volatile(0);
+            }
+        }
+
+        for addr in 0..15u8 {
+            if statests & (1 << addr) != 0 {
+                if let Some(codec) = hda.probe_codec(addr) {
+                    hda.codecs.push(codec);
+                }
+            }
+        }
+        if hda.paths().next().is_none() {
+            return Err("no usable output pins on any codec");
+        }
+        Ok(hda)
     }
 
-    /// Play a WAV audio file directly through Intel HDA
-    pub fn play_wav(&mut self, wav: &WavAudio) -> Result<(), &'static str> {
-        let format = wav.hda_format();
+    /// Send one verb over the immediate command interface.
+    fn verb(&self, codec: u8, nid: u8, verb: u32, payload: u32) -> Option<u32> {
+        let cmd = if verb <= 0xF {
+            ((codec as u32) << 28) | ((nid as u32) << 20) | (verb << 16) | (payload & 0xFFFF)
+        } else {
+            ((codec as u32) << 28) | ((nid as u32) << 20) | (verb << 8) | (payload & 0xFF)
+        };
+        if !crate::interrupts::wait_until(2, || self.r16(ICS) & 1 == 0) {
+            return None;
+        }
+        self.w16(ICS, 0x2); // clear IRV
+        self.w32(ICW, cmd);
+        self.w16(ICS, 0x1); // send
+        let mut sts = 0;
+        if !crate::interrupts::wait_until(2, || {
+            sts = self.r16(ICS);
+            sts & 0x1 == 0 && sts & 0x2 != 0
+        }) {
+            return None;
+        }
+        let resp = self.r32(IRR);
+        self.w16(ICS, 0x2);
+        Some(resp)
+    }
+
+    fn param(&self, codec: u8, nid: u8, p: u32) -> u32 {
+        self.verb(codec, nid, 0xF00, p).unwrap_or(0)
+    }
+
+    fn read_conn_list(&self, codec: u8, nid: u8) -> Vec<u8> {
+        let info = self.param(codec, nid, 0x0E);
+        let len = (info & 0x7F) as usize;
+        let long = info & 0x80 != 0;
+        let per = if long { 2 } else { 4 };
+        let mut list = Vec::new();
+        let mut prev = 0u8;
+        let mut i = 0;
+        while i < len && list.len() < 32 {
+            let resp = self.verb(codec, nid, 0xF02, i as u32).unwrap_or(0);
+            for k in 0..per {
+                if i + k >= len {
+                    break;
+                }
+                let (range, val) = if long {
+                    let e = (resp >> (16 * k)) & 0xFFFF;
+                    (e & 0x8000 != 0, (e & 0x7FFF) as u8)
+                } else {
+                    let e = (resp >> (8 * k)) & 0xFF;
+                    (e & 0x80 != 0, (e & 0x7F) as u8)
+                };
+                if range && prev != 0 && val > prev {
+                    for n in (prev + 1)..=val {
+                        list.push(n);
+                    }
+                } else {
+                    list.push(val);
+                }
+                prev = val;
+            }
+            i += per;
+        }
+        list
+    }
+
+    fn probe_codec(&self, addr: u8) -> Option<Codec> {
+        let vendor_id = self.verb(addr, 0, 0xF00, 0x00)?;
+        let nodes = self.param(addr, 0, 0x04);
+        let (start, count) = (((nodes >> 16) & 0xFF) as u8, (nodes & 0xFF) as u8);
+        let afg = (start..start.saturating_add(count)).find(|&n| self.param(addr, n, 0x05) & 0xFF == 0x01)?;
+
+        // Power up the function group and wait for it.
+        self.verb(addr, afg, 0x705, 0x00);
+        crate::interrupts::delay_ms(10);
+
+        // Many Dell boards gate the jack amplifier with codec GPIOs: enable and drive them high.
+        let gpio_count = self.param(addr, afg, 0x11) & 0xFF;
+        if gpio_count > 0 {
+            let mask = ((1u32 << gpio_count.min(8)) - 1) & 0xFF;
+            self.verb(addr, afg, 0x716, mask);
+            self.verb(addr, afg, 0x717, mask);
+            self.verb(addr, afg, 0x715, mask);
+        }
+
+        let wnodes = self.param(addr, afg, 0x04);
+        let (wstart, wcount) = (((wnodes >> 16) & 0xFF) as u8, (wnodes & 0xFF) as u8);
+        let afg_out_amp = self.param(addr, afg, 0x12);
+        let afg_in_amp = self.param(addr, afg, 0x0D);
+
+        let mut widgets = Vec::new();
+        for nid in wstart..wstart.saturating_add(wcount) {
+            let caps = self.param(addr, nid, 0x09);
+            let wtype = ((caps >> 20) & 0xF) as u8;
+            let conns = if caps & (1 << 8) != 0 { self.read_conn_list(addr, nid) } else { Vec::new() };
+            let (pin_cfg, pin_caps) = if wtype == 4 {
+                (self.verb(addr, nid, 0xF1C, 0).unwrap_or(0), self.param(addr, nid, 0x0C))
+            } else {
+                (0, 0)
+            };
+            // Bit 3 of caps: amp parameters override the function group defaults.
+            let override_amp = caps & (1 << 3) != 0;
+            let out_amp = if caps & (1 << 2) != 0 { if override_amp { self.param(addr, nid, 0x12) } else { afg_out_amp } } else { 0 };
+            let in_amp = if caps & (1 << 1) != 0 { if override_amp { self.param(addr, nid, 0x0D) } else { afg_in_amp } } else { 0 };
+            if caps & (1 << 10) != 0 {
+                self.verb(addr, nid, 0x705, 0x00); // widget power D0
+            }
+            widgets.push(Widget { nid, wtype, caps, conns, pin_cfg, pin_caps, out_amp, in_amp });
+        }
+
+        let mut codec = Codec { addr, vendor_id, afg, widgets, paths: Vec::new() };
+        codec.paths = find_output_paths(&codec);
         crate::println!(
-            "HDA: Playing WAV track (Channels: {}, Rate: {}Hz, Bits: {}, Format: 0x{:04x})",
-            wav.header.num_channels,
-            wav.header.sample_rate,
-            wav.header.bits_per_sample,
-            format
+            "       codec {} [{:08x}]: {} widgets, outputs: {}",
+            addr,
+            vendor_id,
+            codec.widgets.len(),
+            codec.paths.iter().map(|p| p.device).collect::<Vec<_>>().join(", ")
         );
-        self.play_stream(wav.samples(), format)
+        Some(codec)
     }
 
-    /// Play raw PCM samples by streaming them into the DMA ring buffer
-    pub fn play_stream(&mut self, pcm_samples: &[u8], format: u16) -> Result<(), &'static str> {
-        let stream = unsafe { &mut *(self.base_virt.add(self.output_stream_offset) as *mut HdaStreamRegs) };
+    fn paths(&self) -> impl Iterator<Item = &OutputPath> {
+        self.codecs.iter().flat_map(|c| c.paths.iter())
+    }
 
-        // 1. Reset and stop stream
-        stream.ctl_low.write(0);
-        stream.ctl_high.write(0);
+    /// Output kinds this controller can drive.
+    pub fn available_outputs(&self) -> Vec<OutputKind> {
+        let mut v = Vec::new();
+        for k in [OutputKind::Analog, OutputKind::Digital] {
+            if self.paths().any(|p| p.kind == k) {
+                v.push(k);
+            }
+        }
+        v
+    }
 
-        // 2. Configure BDL Base Address
-        stream.bdlpl.write((self.bdl_phys & 0xFFFFFFFF) as u32);
-        stream.bdlpu.write(((self.bdl_phys >> 32) & 0xFFFFFFFF) as u32);
+    pub fn active_output(&self) -> Option<OutputKind> {
+        self.active
+    }
 
-        // Cyclic Buffer Length: total bytes in all BDL entries (2 * buffer_size)
-        stream.cbl.write((self.buffer_size * 2) as u32);
+    /// Human-readable list of pins driven by the active output, e.g. "Headphone 0x14".
+    pub fn active_pins(&self) -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        if let Some(kind) = self.active {
+            for p in self.paths().filter(|p| p.kind == kind) {
+                if !s.is_empty() {
+                    s.push_str(", ");
+                }
+                s.push_str(&alloc::format!("{} {:#04x}", p.device, p.pin()));
+            }
+        }
+        s
+    }
 
-        // Last Valid Index: 1 (2 BDL entries)
-        stream.lvi.write(1);
+    pub fn codec_ids(&self) -> Vec<u32> {
+        self.codecs.iter().map(|c| c.vendor_id).collect()
+    }
 
-        // 3. Set Stream Format
-        stream.fmt.write(format);
+    /// Route audio to the given output kind and silence the other one.
+    pub fn set_output(&mut self, kind: OutputKind) {
+        self.active = Some(kind);
+        for ci in 0..self.codecs.len() {
+            let addr = self.codecs[ci].addr;
+            let paths = self.codecs[ci].paths.clone();
+            // Disable everything first so DACs shared between paths end up configured once.
+            for p in &paths {
+                self.verb(addr, p.pin(), 0x707, 0x00);
+                self.verb(addr, p.dac(), 0x706, 0x00);
+            }
+            for p in paths.iter().filter(|p| p.kind == kind) {
+                self.enable_path(ci, p);
+            }
+        }
+    }
 
-        // Set Stream ID to 1 in bits 7:4 of ctl_high
-        stream.ctl_high.write(1 << 4);
+    fn enable_path(&self, ci: usize, p: &OutputPath) {
+        let codec = &self.codecs[ci];
+        let addr = codec.addr;
+        let pin = codec.widget(p.pin()).unwrap();
+        let pinctl = match p.kind {
+            OutputKind::Digital => 0x40,
+            OutputKind::Analog if p.headphone && pin.pin_caps & (1 << 3) != 0 => 0xC0,
+            OutputKind::Analog => 0x40,
+        };
+        self.verb(addr, pin.nid, 0x707, pinctl);
+        if pin.pin_caps & (1 << 16) != 0 {
+            self.verb(addr, pin.nid, 0x70C, 0x02); // EAPD on
+        }
 
-        // 4. Fill initial buffers with PCM samples
-        let chunk0_size = self.buffer_size.min(pcm_samples.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(pcm_samples.as_ptr(), self.buffer_virt[0], chunk0_size);
-            if chunk0_size < self.buffer_size {
-                core::ptr::write_bytes(self.buffer_virt[0].add(chunk0_size), 0, self.buffer_size - chunk0_size);
+        for (i, &nid) in p.nids.iter().enumerate() {
+            let w = codec.widget(nid).unwrap();
+            if i < p.sel.len() && w.conns.len() > 1 && w.wtype != 2 {
+                self.verb(addr, nid, 0x701, p.sel[i] as u32);
+            }
+            // Unmute this node's input amp on the connection we use (mixers mute the rest).
+            if w.in_amp != 0 || w.caps & (1 << 1) != 0 {
+                if w.wtype == 2 {
+                    for idx in 0..w.conns.len() as u32 {
+                        let mute = if i < p.sel.len() && idx == p.sel[i] as u32 { 0 } else { 0x80 };
+                        let gain = amp_offset(w.in_amp);
+                        self.verb(addr, nid, 0x3, 0x7000 | (idx << 8) | mute | gain);
+                    }
+                } else if i < p.sel.len() {
+                    self.verb(addr, nid, 0x3, 0x7000 | ((p.sel[i] as u32) << 8) | amp_offset(w.in_amp));
+                }
             }
         }
 
-        let remaining = if pcm_samples.len() > chunk0_size { &pcm_samples[chunk0_size..] } else { &[] };
-        let chunk1_size = self.buffer_size.min(remaining.len());
-        unsafe {
-            if chunk1_size > 0 {
-                core::ptr::copy_nonoverlapping(remaining.as_ptr(), self.buffer_virt[1], chunk1_size);
-            }
-            if chunk1_size < self.buffer_size {
-                core::ptr::write_bytes(self.buffer_virt[1].add(chunk1_size), 0, self.buffer_size - chunk1_size);
-            }
+        let dac = codec.widget(p.dac()).unwrap();
+        self.verb(addr, dac.nid, 0x706, STREAM_TAG << 4);
+        if dac.caps & (1 << 9) != 0 {
+            self.verb(addr, dac.nid, 0x70D, 0x01); // digital converter enable
         }
-
-        // 5. Start DMA Stream Engine (SRUN = bit 1)
-        let ctl = stream.ctl_low.read();
-        stream.ctl_low.write(ctl | HDA_SDCTL_SRUN);
-        self.is_playing = true;
-
-        crate::println!("HDA: DMA stream engine active. Audio is now playing via S/PDIF / Line Out!");
-        Ok(())
+        if let Some(fmt) = self.format.and_then(|f| f.to_hda()) {
+            self.verb(addr, dac.nid, 0x2, fmt as u32);
+        }
+        if p.device == "HDMI" {
+            self.setup_hdmi(addr, pin.nid, dac.nid);
+        }
     }
 
-    /// Stop audio playback
-    pub fn stop(&mut self) {
-        let stream = unsafe { &mut *(self.base_virt.add(self.output_stream_offset) as *mut HdaStreamRegs) };
-        let ctl = stream.ctl_low.read();
-        stream.ctl_low.write(ctl & !HDA_SDCTL_SRUN);
-        self.is_playing = false;
-        crate::println!("HDA: Audio playback stopped.");
+    /// HDMI needs more than a digital pin: the converter has to be told it carries two
+    /// channels, the pin's channel slots mapped, and an audio InfoFrame sent so the TV
+    /// knows what the audio packets contain (as Linux patch_hdmi does).
+    fn setup_hdmi(&self, addr: u8, pin: u8, cvt: u8) {
+        self.verb(addr, cvt, 0x72D, 1); // converter channel count: 2 - 1
+        // Stereo slot map: slot 0 <- ch 0, slot 1 <- ch 1, other slots unused (0xf).
+        for slot in 0..8u32 {
+            let ch = if slot < 2 { slot } else { 0xF };
+            self.verb(addr, pin, 0x734, (ch << 4) | slot);
+        }
+        // Audio InfoFrame: type 0x84, version 1, length 10, 2 channels, everything else
+        // "refer to stream header".
+        let mut frame = [0x84u8, 0x01, 0x0A, 0, 0x01, 0, 0, 0, 0];
+        let sum = frame.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        frame[3] = 0u8.wrapping_sub(sum);
+        self.verb(addr, pin, 0x730, 0); // DIP index: packet 0 (audio InfoFrame), byte 0
+        self.verb(addr, pin, 0x732, 0x00); // stop sending while it's rewritten
+        self.verb(addr, pin, 0x730, 0);
+        for b in frame {
+            self.verb(addr, pin, 0x731, b as u32);
+        }
+        self.verb(addr, pin, 0x730, 0);
+        self.verb(addr, pin, 0x732, 0xC0); // send continuously (best effort)
     }
+
+}
+
+fn amp_offset(amp_caps: u32) -> u32 {
+    amp_caps & 0x7F
+}
+
+/// Map a pin configuration default to (kind, label, is_headphone), or None if the pin
+/// is not a connected output.
+fn classify_pin(w: &Widget) -> Option<(OutputKind, &'static str, bool)> {
+    let connectivity = w.pin_cfg >> 30;
+    let hdmi_capable = w.pin_caps & (1 << 7) != 0;
+    if w.pin_caps & (1 << 4) == 0 {
+        return None; // not output capable
+    }
+    if connectivity == 1 {
+        // "No physical connection". BIOSes sometimes say this about the graphics chip's
+        // HDMI audio pin even though the board has an HDMI connector, so keep those.
+        if !hdmi_capable {
+            return None;
+        }
+        return Some((OutputKind::Digital, "HDMI", false));
+    }
+    let device = (w.pin_cfg >> 20) & 0xF;
+    match device {
+        0x0 => Some((OutputKind::Analog, "Line-out", false)),
+        0x1 => Some((OutputKind::Analog, "Speaker", false)),
+        0x2 => Some((OutputKind::Analog, "Headphone", true)),
+        0x4 => Some((OutputKind::Digital, "S/PDIF", false)),
+        0x5 => Some((OutputKind::Digital, if w.pin_caps & (1 << 7) != 0 { "HDMI" } else { "Digital" }, false)),
+        _ => None,
+    }
+}
+
+fn find_output_paths(codec: &Codec) -> Vec<OutputPath> {
+    let mut paths = Vec::new();
+    for pin in codec.widgets.iter().filter(|w| w.wtype == 4) {
+        let Some((kind, device, headphone)) = classify_pin(pin) else { continue };
+        let mut nids = alloc::vec![pin.nid];
+        let mut sel = Vec::new();
+        if dfs_to_dac(codec, pin.nid, kind == OutputKind::Digital, &mut nids, &mut sel, 0) {
+            paths.push(OutputPath { kind, device, nids, sel, headphone });
+        }
+    }
+    paths
+}
+
+fn dfs_to_dac(codec: &Codec, nid: u8, digital: bool, nids: &mut Vec<u8>, sel: &mut Vec<u8>, depth: usize) -> bool {
+    let Some(w) = codec.widget(nid) else { return false };
+    if depth > 0 && w.wtype == 0 {
+        let is_digital = w.caps & (1 << 9) != 0;
+        // Analog pins need an analog DAC; digital pins take whatever converter feeds them.
+        return digital || !is_digital;
+    }
+    if depth > 5 {
+        return false;
+    }
+    for (idx, &next) in w.conns.iter().enumerate() {
+        if nids.contains(&next) {
+            continue;
+        }
+        let Some(nw) = codec.widget(next) else { continue };
+        // Only walk through audio outputs, mixers, selectors and power widgets.
+        if !matches!(nw.wtype, 0 | 2 | 3) {
+            continue;
+        }
+        nids.push(next);
+        sel.push(idx as u8);
+        if dfs_to_dac(codec, next, digital, nids, sel, depth + 1) {
+            return true;
+        }
+        nids.pop();
+        sel.pop();
+    }
+    false
+}
+
+#[test_case]
+fn test_pcm_format_words() {
+    assert_eq!(PcmFormat { rate: 48000, bits: 16 }.to_hda(), Some(0x0011));
+    assert_eq!(PcmFormat { rate: 44100, bits: 16 }.to_hda(), Some(0x4011));
+    assert_eq!(PcmFormat { rate: 96000, bits: 24 }.to_hda(), Some(0x0831));
+    assert_eq!(PcmFormat { rate: 88200, bits: 16 }.to_hda(), Some(0x4811));
+    assert_eq!(PcmFormat { rate: 12345, bits: 16 }.to_hda(), None);
 }
