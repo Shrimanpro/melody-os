@@ -93,6 +93,24 @@ impl PcmFormat {
     }
 }
 
+/// Bit in the codec's supported-PCM parameter for a given sample rate.
+fn rate_cap_bit(rate: u32) -> Option<u32> {
+    Some(match rate {
+        8000 => 0,
+        11025 => 1,
+        16000 => 2,
+        22050 => 3,
+        32000 => 4,
+        44100 => 5,
+        48000 => 6,
+        88200 => 7,
+        96000 => 8,
+        176400 => 9,
+        192000 => 10,
+        _ => return None,
+    })
+}
+
 #[derive(Clone)]
 struct Widget {
     nid: u8,
@@ -441,6 +459,7 @@ impl HdaController {
                 self.enable_path(ci, p);
             }
         }
+        self.apply_volume();
     }
 
     fn enable_path(&self, ci: usize, p: &OutputPath) {
@@ -512,6 +531,72 @@ impl HdaController {
         }
         self.verb(addr, pin, 0x730, 0);
         self.verb(addr, pin, 0x732, 0xC0); // send continuously (best effort)
+    }
+
+    /// The amp used as the volume control on a path: the first output amp with real steps,
+    /// searching from the DAC towards the pin.
+    fn volume_amp(codec: &Codec, p: &OutputPath) -> Option<u8> {
+        p.nids.iter().rev().copied().find(|&n| {
+            codec.widget(n).map(|w| (w.out_amp >> 8) & 0x7F > 0).unwrap_or(false)
+        })
+    }
+
+    /// Whether volume is applied in hardware (codec amplifier) on the active output.
+    pub fn has_hw_volume(&self) -> bool {
+        let Some(kind) = self.active else { return false };
+        self.codecs.iter().any(|c| c.paths.iter().filter(|p| p.kind == kind).any(|p| Self::volume_amp(c, p).is_some()))
+    }
+
+    pub fn set_volume(&mut self, volume: u8, muted: bool) {
+        self.volume = volume.min(100);
+        self.muted = muted;
+        self.apply_volume();
+    }
+
+    fn apply_volume(&self) {
+        let Some(kind) = self.active else { return };
+        for codec in &self.codecs {
+            for p in codec.paths.iter().filter(|p| p.kind == kind) {
+                let vol_nid = Self::volume_amp(codec, p);
+                for &nid in &p.nids {
+                    let w = codec.widget(nid).unwrap();
+                    if w.out_amp == 0 && w.caps & (1 << 2) == 0 {
+                        continue;
+                    }
+                    let steps = (w.out_amp >> 8) & 0x7F;
+                    let gain = if Some(nid) == vol_nid {
+                        // Map 0-100 linearly onto the amp's steps (steps are ~0.75-1.5 dB each).
+                        steps * self.volume as u32 / 100
+                    } else {
+                        amp_offset(w.out_amp)
+                    };
+                    let mute = if self.muted || (Some(nid) == vol_nid && self.volume == 0) { 0x80 } else { 0 };
+                    self.verb(codec.addr, nid, 0x3, 0xB000 | mute | gain);
+                }
+            }
+        }
+    }
+
+    /// Pick the closest format every active DAC supports for a source rate/bit depth.
+    pub fn negotiate(&self, rate: u32, bits: u8) -> Result<PcmFormat, &'static str> {
+        let kind = self.active.ok_or("no output selected")?;
+        let mut caps = 0xFFFF_FFFFu32;
+        for codec in &self.codecs {
+            for p in codec.paths.iter().filter(|p| p.kind == kind) {
+                let dac = codec.widget(p.dac()).unwrap();
+                let mut pcm = self.param(codec.addr, dac.nid, 0x0A);
+                if pcm == 0 {
+                    pcm = self.param(codec.addr, codec.afg, 0x0A);
+                }
+                caps &= pcm;
+            }
+        }
+        let rate_ok = |r: u32| rate_cap_bit(r).map(|b| caps & (1 << b) != 0).unwrap_or(false);
+        let out_bits = if bits > 16 && caps & (1 << 19) != 0 { 24 } else { 16 };
+        if rate_ok(rate) {
+            return Ok(PcmFormat { rate, bits: out_bits });
+        }
+        Err("sample rate not supported by the codec")
     }
 
     fn sd_r32(&self, off: usize) -> u32 { self.r32(self.sd + off) }
