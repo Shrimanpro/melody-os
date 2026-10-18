@@ -4,6 +4,9 @@
 //!   default (analog line-out/headphone/speaker vs. digital S/PDIF/HDMI) and a path back
 //!   to a DAC is found through the connection lists. Only the selected output's paths are
 //!   enabled.
+//! - One output stream plays from a 512 KiB cyclic DMA ring. The driver tracks the hardware
+//!   read position (LPIB) and keeps a known amount of data queued ahead of it; when the
+//!   player has nothing to give, silence is queued instead so stale audio never replays.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -511,10 +514,196 @@ impl HdaController {
         self.verb(addr, pin, 0x732, 0xC0); // send continuously (best effort)
     }
 
+    fn sd_r32(&self, off: usize) -> u32 { self.r32(self.sd + off) }
+    fn sd_w32(&self, off: usize, v: u32) { self.w32(self.sd + off, v) }
+
+    /// Stop the stream engine and reset it.
+    fn reset_stream(&mut self) {
+        let ctl = self.sd_r32(SD_CTL);
+        self.sd_w32(SD_CTL, ctl & !SD_CTL_RUN);
+        crate::interrupts::wait_until(10, || self.sd_r32(SD_CTL) & SD_CTL_RUN == 0);
+        self.sd_w32(SD_CTL, SD_CTL_SRST);
+        crate::interrupts::wait_until(10, || self.sd_r32(SD_CTL) & SD_CTL_SRST != 0);
+        self.sd_w32(SD_CTL, 0);
+        crate::interrupts::wait_until(10, || self.sd_r32(SD_CTL) & SD_CTL_SRST == 0);
+        self.w8(self.sd + 0x03, 0x1C); // clear status bits
+        self.running = false;
+    }
+
+    /// Program a new PCM format and empty the ring. Playback starts with `start()`.
+    pub fn prepare(&mut self, fmt: PcmFormat) -> Result<(), &'static str> {
+        let word = fmt.to_hda().ok_or("unsupported PCM format")?;
+        self.reset_stream();
+        self.format = Some(fmt);
+
+        // Converters get the same format word as the stream descriptor.
+        if let Some(kind) = self.active {
+            for codec in &self.codecs {
+                for p in codec.paths.iter().filter(|p| p.kind == kind) {
+                    self.verb(codec.addr, p.dac(), 0x2, word as u32);
+                    self.verb(codec.addr, p.dac(), 0x706, STREAM_TAG << 4);
+                }
+            }
+        }
+
+        self.ring.as_slice().fill(0);
+        flush_cache(self.ring.virt, RING_BYTES);
+        flush_cache(self.bdl.virt, RING_PAGES * 16);
+
+        self.sd_w32(SD_BDPL, self.bdl.phys as u32);
+        self.sd_w32(SD_BDPU, (self.bdl.phys >> 32) as u32);
+        self.sd_w32(SD_CBL, RING_BYTES as u32);
+        self.w16(self.sd + SD_LVI, (RING_PAGES - 1) as u16);
+        self.w16(self.sd + SD_FMT, word);
+        self.sd_w32(SD_CTL, STREAM_TAG << 20);
+
+        self.write_pos = 0;
+        self.last_lpib = 0;
+        self.ahead = 0;
+        self.segments.clear();
+        Ok(())
+    }
+
+    pub fn format(&self) -> Option<PcmFormat> {
+        self.format
+    }
+
+    pub fn start(&mut self) {
+        if self.format.is_none() {
+            return;
+        }
+        self.last_lpib = self.sd_r32(SD_LPIB) as usize % RING_BYTES;
+        let ctl = self.sd_r32(SD_CTL);
+        self.sd_w32(SD_CTL, ctl | SD_CTL_RUN);
+        self.running = true;
+    }
+
+    pub fn pause(&mut self) {
+        let ctl = self.sd_r32(SD_CTL);
+        self.sd_w32(SD_CTL, ctl & !SD_CTL_RUN);
+        crate::interrupts::wait_until(10, || self.sd_r32(SD_CTL) & SD_CTL_RUN == 0);
+        self.running = false;
+    }
+
+    pub fn stop(&mut self) {
+        self.reset_stream();
+        self.format = None;
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    pub fn lpib(&self) -> u32 {
+        self.sd_r32(SD_LPIB)
+    }
+
+    /// Account for what the hardware consumed since the last call.
+    pub fn update_position(&mut self) {
+        if !self.running {
+            return;
+        }
+        let lpib = self.sd_r32(SD_LPIB) as usize % RING_BYTES;
+        let consumed = (lpib + RING_BYTES - self.last_lpib) % RING_BYTES;
+        self.last_lpib = lpib;
+        self.ahead -= consumed as isize;
+        let mut left = consumed;
+        while left > 0 {
+            let Some(front) = self.segments.front_mut() else { break };
+            let take = left.min(front.0);
+            front.0 -= take;
+            left -= take;
+            if front.0 == 0 {
+                self.segments.pop_front();
+            }
+        }
+        if self.ahead < 0 {
+            // We fell behind the DMA engine: restart writing just ahead of it.
+            self.underruns += 1;
+            let frame = self.format.map(|f| f.frame_bytes()).unwrap_or(4);
+            self.write_pos = (lpib + 4096) / frame * frame % RING_BYTES;
+            self.ahead = ((self.write_pos + RING_BYTES - lpib) % RING_BYTES) as isize;
+            self.segments.clear();
+            self.push_segment(self.ahead as usize, true);
+        }
+    }
+
+    fn push_segment(&mut self, bytes: usize, silence: bool) {
+        match self.segments.back_mut() {
+            Some(last) if last.1 == silence => last.0 += bytes,
+            _ => self.segments.push_back((bytes, silence)),
+        }
+    }
+
+    /// Bytes of *real* audio queued ahead of the hardware.
+    pub fn queued_audio(&self) -> usize {
+        self.segments.iter().filter(|s| !s.1).map(|s| s.0).sum()
+    }
+
+    /// How many bytes can be written right now.
+    pub fn free_space(&mut self) -> usize {
+        self.update_position();
+        // Keep one page between the writer and the hardware read pointer.
+        (RING_BYTES - 4096).saturating_sub(self.ahead.max(0) as usize)
+    }
+
+    /// Copy PCM bytes into the ring; returns how many were taken.
+    pub fn write(&mut self, data: &[u8]) -> usize {
+        let n = data.len().min(self.free_space());
+        let mut done = 0;
+        while done < n {
+            let chunk = (n - done).min(RING_BYTES - self.write_pos);
+            unsafe {
+                let dst = self.ring.virt.add(self.write_pos);
+                core::ptr::copy_nonoverlapping(data.as_ptr().add(done), dst, chunk);
+                flush_cache(dst, chunk);
+            }
+            self.write_pos = (self.write_pos + chunk) % RING_BYTES;
+            done += chunk;
+        }
+        self.ahead += n as isize;
+        self.push_segment(n, false);
+        n
+    }
+
+    /// Keep at least `min_bytes` queued by appending silence (used when the decoder or the
+    /// USB stick can't keep up, and while draining at the end of a track).
+    pub fn pad_silence(&mut self, min_bytes: usize) {
+        self.update_position();
+        let ahead = self.ahead.max(0) as usize;
+        if ahead >= min_bytes {
+            return;
+        }
+        let want = (min_bytes - ahead).min(self.free_space());
+        let mut done = 0;
+        while done < want {
+            let chunk = (want - done).min(RING_BYTES - self.write_pos);
+            unsafe {
+                let dst = self.ring.virt.add(self.write_pos);
+                core::ptr::write_bytes(dst, 0, chunk);
+                flush_cache(dst, chunk);
+            }
+            self.write_pos = (self.write_pos + chunk) % RING_BYTES;
+            done += chunk;
+        }
+        self.ahead += want as isize;
+        self.push_segment(want, true);
+    }
 }
 
 fn amp_offset(amp_caps: u32) -> u32 {
     amp_caps & 0x7F
+}
+
+fn flush_cache(ptr: *mut u8, len: usize) {
+    let start = ptr as usize & !63;
+    let end = ptr as usize + len;
+    let mut p = start;
+    while p < end {
+        unsafe { core::arch::x86_64::_mm_clflush(p as *const u8) };
+        p += 64;
+    }
+    unsafe { core::arch::x86_64::_mm_mfence() };
 }
 
 /// Map a pin configuration default to (kind, label, is_headphone), or None if the pin
