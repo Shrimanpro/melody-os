@@ -3,8 +3,9 @@
 pub mod hda;
 pub mod wav;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use crate::fs::{BlockDevice, FatVolume, FileReader};
+use crate::fs::{AudioKind, BlockDevice, FatVolume, FileReader};
 
 /// Something decoders can pull bytes from.
 pub trait ByteRead {
@@ -132,6 +133,13 @@ pub trait Decoder: Send {
     /// values with the significant bits at the top (a 16-bit sample is `s << 16`).
     /// Returns Ok(false) once the stream is finished.
     fn decode(&mut self, input: &mut dyn ByteRead, out: &mut Vec<i32>) -> Result<bool, &'static str>;
+}
+
+pub fn open_decoder(kind: AudioKind, input: &mut dyn ByteRead, _file_size: u64) -> Result<Box<dyn Decoder>, &'static str> {
+    match kind {
+        AudioKind::Wav => Ok(Box::new(wav::WavDecoder::open(input)?)),
+        _ => Err("format not supported yet"),
+    }
 }
 
 /// Converts decoder samples into the byte layout the HDA stream expects.

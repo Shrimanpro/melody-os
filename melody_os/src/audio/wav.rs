@@ -1,147 +1,216 @@
-/// RIFF WAV Audio file parser.
-#[derive(Debug, Clone, Copy)]
-pub struct WavHeader {
-    pub num_channels: u16,
+//! Streaming RIFF/WAVE decoder: PCM 8/16/24/32-bit integer and 32-bit float,
+//! plain or WAVE_FORMAT_EXTENSIBLE, mono or multichannel (first two channels are played).
+
+use alloc::vec::Vec;
+use super::{ByteRead, Decoder, StreamInfo};
+
+const FORMAT_PCM: u16 = 1;
+const FORMAT_FLOAT: u16 = 3;
+const FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WavFormat {
+    pub float: bool,
+    pub channels: u16,
     pub sample_rate: u32,
-    pub byte_rate: u32,
-    pub block_align: u16,
     pub bits_per_sample: u16,
-    pub data_offset: usize,
-    pub data_size: usize,
+    pub block_align: u16,
+    pub data_size: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct WavAudio<'a> {
-    pub header: WavHeader,
-    pub raw_data: &'a [u8],
+impl WavFormat {
+    pub fn total_frames(&self) -> u64 {
+        if self.block_align == 0 { 0 } else { self.data_size / self.block_align as u64 }
+    }
 }
 
-impl<'a> WavAudio<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, &'static str> {
-        if bytes.len() < 44 {
-            return Err("WAV data too short (less than 44 bytes)");
-        }
+fn u16le(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
 
-        // Check RIFF header
-        if &bytes[0..4] != b"RIFF" {
-            return Err("Invalid RIFF header");
-        }
-        if &bytes[8..12] != b"WAVE" {
-            return Err("Invalid WAVE format signature");
-        }
+fn u32le(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
 
-        // Search for "fmt " chunk
-        let mut offset = 12;
-        let mut fmt_header = None;
-        let mut data_chunk = None;
+/// Read chunks until the "data" chunk; leaves `input` positioned at the first sample.
+pub fn read_header(input: &mut dyn ByteRead) -> Result<WavFormat, &'static str> {
+    let mut riff = [0u8; 12];
+    input.read_exact(&mut riff).map_err(|e| if e == "unexpected end of file" { "file too short for a WAV header" } else { e })?;
+    if &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
+        return Err("not a RIFF/WAVE file");
+    }
 
-        while offset + 8 <= bytes.len() {
-            let chunk_id = &bytes[offset..offset + 4];
-            let chunk_size = u32::from_le_bytes([
-                bytes[offset + 4],
-                bytes[offset + 5],
-                bytes[offset + 6],
-                bytes[offset + 7],
-            ]) as usize;
-
-            let chunk_data_offset = offset + 8;
-            if chunk_data_offset + chunk_size > bytes.len() {
-                break;
-            }
-
-            if chunk_id == b"fmt " {
-                if chunk_size < 16 {
-                    return Err("fmt chunk too small");
+    let mut fmt: Option<WavFormat> = None;
+    for _ in 0..64 {
+        let mut hdr = [0u8; 8];
+        input.read_exact(&mut hdr).map_err(|e| if e == "unexpected end of file" { "WAV file has no data chunk" } else { e })?;
+        let size = u32le(&hdr[4..8]) as u64;
+        match &hdr[0..4] {
+            b"fmt " => {
+                if !(16..=64).contains(&size) {
+                    return Err("malformed fmt chunk");
                 }
-                let audio_format = u16::from_le_bytes([bytes[chunk_data_offset], bytes[chunk_data_offset + 1]]);
-                if audio_format != 1 {
-                    // 1 = PCM
-                    return Err("Only uncompressed PCM WAV files are supported");
+                let mut b = [0u8; 64];
+                input.read_exact(&mut b[..size as usize])?;
+                if size % 2 == 1 {
+                    input.skip(1)?;
                 }
-                let num_channels = u16::from_le_bytes([bytes[chunk_data_offset + 2], bytes[chunk_data_offset + 3]]);
-                let sample_rate = u32::from_le_bytes([
-                    bytes[chunk_data_offset + 4],
-                    bytes[chunk_data_offset + 5],
-                    bytes[chunk_data_offset + 6],
-                    bytes[chunk_data_offset + 7],
-                ]);
-                let byte_rate = u32::from_le_bytes([
-                    bytes[chunk_data_offset + 8],
-                    bytes[chunk_data_offset + 9],
-                    bytes[chunk_data_offset + 10],
-                    bytes[chunk_data_offset + 11],
-                ]);
-                let block_align = u16::from_le_bytes([bytes[chunk_data_offset + 12], bytes[chunk_data_offset + 13]]);
-                let bits_per_sample = u16::from_le_bytes([bytes[chunk_data_offset + 14], bytes[chunk_data_offset + 15]]);
-
-                fmt_header = Some((num_channels, sample_rate, byte_rate, block_align, bits_per_sample));
-            } else if chunk_id == b"data" {
-                data_chunk = Some((chunk_data_offset, chunk_size));
-                break;
+                let mut tag = u16le(&b[0..2]);
+                let bits = u16le(&b[14..16]);
+                if tag == FORMAT_EXTENSIBLE {
+                    if size < 40 {
+                        return Err("malformed extensible fmt chunk");
+                    }
+                    // The sub-format GUID starts with the real format tag.
+                    tag = u16le(&b[24..26]);
+                }
+                let float = match tag {
+                    FORMAT_PCM => false,
+                    FORMAT_FLOAT if bits == 32 => true,
+                    FORMAT_FLOAT => return Err("only 32-bit float WAV is supported"),
+                    _ => return Err("compressed WAV (not PCM) is not supported"),
+                };
+                let channels = u16le(&b[2..4]);
+                let block_align = u16le(&b[12..14]);
+                if channels == 0 || !matches!(bits, 8 | 16 | 24 | 32) || block_align < channels * (bits / 8) {
+                    return Err("unsupported WAV sample layout");
+                }
+                fmt = Some(WavFormat {
+                    float,
+                    channels,
+                    sample_rate: u32le(&b[4..8]),
+                    bits_per_sample: bits,
+                    block_align,
+                    data_size: 0,
+                });
             }
-
-            offset = chunk_data_offset + chunk_size;
-            // Chunks are 2-byte aligned
-            if (offset % 2) != 0 {
-                offset += 1;
+            b"data" => {
+                let mut f = fmt.ok_or("data chunk before fmt chunk")?;
+                f.data_size = size;
+                return Ok(f);
+            }
+            _ => {
+                input.skip(size + (size & 1))?;
             }
         }
+    }
+    Err("WAV file has no data chunk")
+}
 
-        let (num_channels, sample_rate, byte_rate, block_align, bits_per_sample) =
-            fmt_header.ok_or("Missing fmt chunk in WAV file")?;
-        let (data_offset, data_size) =
-            data_chunk.ok_or("Missing data chunk in WAV file")?;
+pub struct WavDecoder {
+    fmt: WavFormat,
+    remaining: u64,
+    buf: Vec<u8>,
+}
 
-        let header = WavHeader {
-            num_channels,
-            sample_rate,
-            byte_rate,
-            block_align,
-            bits_per_sample,
-            data_offset,
-            data_size,
-        };
+/// Frames decoded per call.
+const BLOCK_FRAMES: usize = 4096;
 
-        Ok(WavAudio {
-            header,
-            raw_data: bytes,
-        })
+impl WavDecoder {
+    pub fn open(input: &mut dyn ByteRead) -> Result<Self, &'static str> {
+        let fmt = read_header(input)?;
+        // Some encoders write 0 or 0xFFFFFFFF for streamed files: play until EOF.
+        let remaining = if fmt.data_size == 0 || fmt.data_size == 0xFFFF_FFFF { u64::MAX } else { fmt.data_size };
+        Ok(WavDecoder { fmt, remaining, buf: alloc::vec![0u8; BLOCK_FRAMES * fmt.block_align as usize] })
     }
 
-    /// Returns a slice containing only the raw PCM sample bytes (RIFF header stripped)
-    pub fn samples(&self) -> &'a [u8] {
-        let end = self.header.data_offset + self.header.data_size;
-        &self.raw_data[self.header.data_offset..end.min(self.raw_data.len())]
-    }
-
-    /// Compute HDA stream format bitfield for this audio track
-    pub fn hda_format(&self) -> u16 {
-        calculate_hda_format(self.header.sample_rate, self.header.num_channels, self.header.bits_per_sample)
+    pub fn format(&self) -> WavFormat {
+        self.fmt
     }
 }
 
-pub fn calculate_hda_format(sample_rate: u32, num_channels: u16, bits_per_sample: u16) -> u16 {
-    // Base rate: 0 for 48 kHz, 1 for 44.1 kHz
-    let base_rate_bit = if sample_rate == 44100 { 1u16 << 14 } else { 0u16 };
+/// Convert one sample to a 32-bit MSB-aligned integer.
+fn sample_to_i32(b: &[u8], bits: u16, float: bool) -> i32 {
+    match (bits, float) {
+        (8, _) => ((b[0] as i32) - 128) << 24, // 8-bit WAV is unsigned
+        (16, _) => (i16::from_le_bytes([b[0], b[1]]) as i32) << 16,
+        (24, _) => i32::from_le_bytes([0, b[0], b[1], b[2]]),
+        (32, false) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        (32, true) => f32_bits_to_i32(u32le(b)),
+        _ => 0,
+    }
+}
 
-    // Bits per sample:
-    // 000: 8 bits
-    // 001: 16 bits
-    // 010: 20 bits
-    // 011: 24 bits
-    // 100: 32 bits
-    let bits_val = match bits_per_sample {
-        8 => 0,
-        16 => 1,
-        20 => 2,
-        24 => 3,
-        32 => 4,
-        _ => 1,
+/// IEEE-754 single in [-1, 1] -> i32 full scale, using integer operations only
+/// (the kernel is built without an FPU target).
+fn f32_bits_to_i32(bits: u32) -> i32 {
+    let sign = bits >> 31 != 0;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = (bits & 0x7F_FFFF) | 0x80_0000;
+    if exp == 0 {
+        return 0; // zero / denormal
+    }
+    // value = mant * 2^(exp - 127 - 23); we want value * 2^31.
+    let shift = exp - 127 - 23 + 31;
+    let mag: i64 = if shift >= 0 {
+        if shift > 40 { i64::MAX } else { (mant as i64) << shift }
+    } else if shift > -32 {
+        (mant as i64) >> -shift
+    } else {
+        0
     };
-    let bits_field = (bits_val as u16) << 4;
+    let mag = mag.min(i32::MAX as i64);
+    if sign { -(mag as i32) } else { mag as i32 }
+}
 
-    // Number of channels - 1 (e.g. 0 for mono, 1 for stereo)
-    let channels_field = (num_channels.saturating_sub(1)) & 0x0F;
+impl Decoder for WavDecoder {
+    fn info(&self) -> StreamInfo {
+        let f = &self.fmt;
+        StreamInfo {
+            sample_rate: f.sample_rate,
+            bits: f.bits_per_sample as u8,
+            channels: f.channels.min(255) as u8,
+            total_frames: f.total_frames(),
+            kbps: f.sample_rate * f.block_align as u32 * 8 / 1000,
+        }
+    }
 
-    base_rate_bit | bits_field | channels_field
+    fn codec_name(&self) -> &'static str {
+        "WAV"
+    }
+
+    fn decode(&mut self, input: &mut dyn ByteRead, out: &mut Vec<i32>) -> Result<bool, &'static str> {
+        if self.remaining == 0 {
+            return Ok(false);
+        }
+        let align = self.fmt.block_align as usize;
+        let want = (self.buf.len() as u64).min(self.remaining) as usize / align * align;
+        if want == 0 {
+            return Ok(false);
+        }
+
+        let mut got = 0;
+        while got < want {
+            let n = input.read(&mut self.buf[got..want])?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        let frames = got / align;
+        if frames == 0 {
+            self.remaining = 0;
+            return Ok(false);
+        }
+        self.remaining = self.remaining.saturating_sub((frames * align) as u64);
+
+        let bytes = (self.fmt.bits_per_sample / 8) as usize;
+        let (bits, float, stereo) = (self.fmt.bits_per_sample, self.fmt.float, self.fmt.channels >= 2);
+        out.reserve(frames * 2);
+        for frame in self.buf[..frames * align].chunks_exact(align) {
+            let l = sample_to_i32(&frame[0..bytes], bits, float);
+            let r = if stereo { sample_to_i32(&frame[bytes..2 * bytes], bits, float) } else { l };
+            out.push(l);
+            out.push(r);
+        }
+        Ok(got == want && self.remaining > 0)
+    }
+}
+
+#[test_case]
+fn test_float_conversion() {
+    assert_eq!(f32_bits_to_i32(0x0000_0000), 0); // 0.0
+    assert_eq!(f32_bits_to_i32(0x3F00_0000), 1 << 30); // 0.5
+    assert_eq!(f32_bits_to_i32(0xBF00_0000), -(1 << 30)); // -0.5
+    assert_eq!(f32_bits_to_i32(0x3F80_0000), i32::MAX); // 1.0 clips
 }

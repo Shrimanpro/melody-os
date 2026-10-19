@@ -4,13 +4,20 @@
 #![test_runner(melody_os::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
-use core::panic::PanicInfo;
-use melody_os::audio::wav::WavAudio;
+extern crate alloc;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+use alloc::vec::Vec;
+use bootloader::{entry_point, BootInfo};
+use core::panic::PanicInfo;
+use melody_os::audio::wav::{read_header, WavDecoder};
+use melody_os::audio::Decoder;
+
+entry_point!(main);
+
+fn main(boot_info: &'static BootInfo) -> ! {
+    melody_os::init_with_memory(boot_info);
     test_main();
-    loop {}
+    melody_os::hlt_loop();
 }
 
 #[panic_handler]
@@ -18,37 +25,77 @@ fn panic(info: &PanicInfo) -> ! {
     melody_os::test_panic_handler(info)
 }
 
+/// Build a WAV file: optional extra chunk before "data", plain or extensible fmt.
+fn make_wav(channels: u16, rate: u32, bits: u16, extensible: bool, samples: &[u8]) -> Vec<u8> {
+    let block = channels * bits / 8;
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&(if extensible { 0xFFFEu16 } else { 1 }).to_le_bytes());
+    fmt.extend_from_slice(&channels.to_le_bytes());
+    fmt.extend_from_slice(&rate.to_le_bytes());
+    fmt.extend_from_slice(&(rate * block as u32).to_le_bytes());
+    fmt.extend_from_slice(&block.to_le_bytes());
+    fmt.extend_from_slice(&bits.to_le_bytes());
+    if extensible {
+        fmt.extend_from_slice(&22u16.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        fmt.extend_from_slice(&3u32.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // sub-format GUID starts with PCM tag
+        fmt.extend_from_slice(&[0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71]);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"RIFF\0\0\0\0WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+    out.extend_from_slice(&fmt);
+    out.extend_from_slice(b"LIST\x04\0\0\0junk");
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    out.extend_from_slice(samples);
+    out
+}
+
 #[test_case]
-fn test_wav_parser_riff_pcm() {
-    // Generate a minimal valid 44-byte WAV PCM header + 4 bytes of audio
-    let mut wav_bytes = [0u8; 48];
-    // RIFF chunk descriptor
-    wav_bytes[0..4].copy_from_slice(b"RIFF");
-    wav_bytes[4..8].copy_from_slice(&(40u32.to_le_bytes())); // ChunkSize = 48 - 8 = 40
-    wav_bytes[8..12].copy_from_slice(b"WAVE");
+fn header_skips_unknown_chunks() {
+    let wav = make_wav(2, 44100, 16, false, &[0; 16]);
+    let fmt = read_header(&mut &wav[..]).unwrap();
+    assert_eq!((fmt.channels, fmt.sample_rate, fmt.bits_per_sample), (2, 44100, 16));
+    assert_eq!(fmt.total_frames(), 4);
+}
 
-    // "fmt " sub-chunk
-    wav_bytes[12..16].copy_from_slice(b"fmt ");
-    wav_bytes[16..20].copy_from_slice(&(16u32.to_le_bytes())); // Subchunk1Size = 16 for PCM
-    wav_bytes[20..22].copy_from_slice(&(1u16.to_le_bytes()));  // AudioFormat = 1 (PCM)
-    wav_bytes[22..24].copy_from_slice(&(2u16.to_le_bytes()));  // NumChannels = 2 (stereo)
-    wav_bytes[24..28].copy_from_slice(&(44100u32.to_le_bytes())); // SampleRate = 44100 Hz
-    wav_bytes[28..32].copy_from_slice(&(176400u32.to_le_bytes())); // ByteRate = 44100 * 2 * 2
-    wav_bytes[32..34].copy_from_slice(&(4u16.to_le_bytes()));  // BlockAlign = 4
-    wav_bytes[34..36].copy_from_slice(&(16u16.to_le_bytes())); // BitsPerSample = 16
+#[test_case]
+fn decodes_16bit_stereo() {
+    let wav = make_wav(2, 44100, 16, false, &[0x34, 0x12, 0xCC, 0xED]);
+    let mut input = &wav[..];
+    let mut dec = WavDecoder::open(&mut input).unwrap();
+    let mut out = Vec::new();
+    dec.decode(&mut input, &mut out).unwrap();
+    assert_eq!(out, [0x1234 << 16, -0x1234 << 16]);
+}
 
-    // "data" sub-chunk
-    wav_bytes[36..40].copy_from_slice(b"data");
-    wav_bytes[40..44].copy_from_slice(&(4u32.to_le_bytes())); // Subchunk2Size = 4 bytes
-    wav_bytes[44..48].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]); // 1 stereo 16-bit sample
+#[test_case]
+fn decodes_24bit_extensible() {
+    let wav = make_wav(2, 96000, 24, true, &[0x56, 0x34, 0x12, 0xFF, 0xFF, 0xFF]);
+    let mut input = &wav[..];
+    let mut dec = WavDecoder::open(&mut input).unwrap();
+    assert_eq!(dec.info().sample_rate, 96000);
+    let mut out = Vec::new();
+    dec.decode(&mut input, &mut out).unwrap();
+    assert_eq!(out, [0x1234_5600, -256]);
+}
 
-    let wav = WavAudio::parse(&wav_bytes).expect("Failed to parse valid WAV");
-    assert_eq!(wav.header.num_channels, 2);
-    assert_eq!(wav.header.sample_rate, 44100);
-    assert_eq!(wav.header.bits_per_sample, 16);
-    assert_eq!(wav.samples(), &[0x12, 0x34, 0x56, 0x78]);
+#[test_case]
+fn mono_8bit_is_duplicated_to_stereo() {
+    let wav = make_wav(1, 22050, 8, false, &[0xFF, 0x00]);
+    let mut input = &wav[..];
+    let mut dec = WavDecoder::open(&mut input).unwrap();
+    let mut out = Vec::new();
+    dec.decode(&mut input, &mut out).unwrap();
+    assert_eq!(out, [127 << 24, 127 << 24, -128 << 24, -128 << 24]);
+}
 
-    // HDA format check: 44.1kHz (bit 14 = 1), 16-bit (bits 6:4 = 001), 2 channels (bits 3:0 = 1)
-    let expected_hda_fmt = (1 << 14) | (1 << 4) | 1;
-    assert_eq!(wav.hda_format(), expected_hda_fmt);
+#[test_case]
+fn rejects_compressed_wav() {
+    let mut wav = make_wav(2, 44100, 16, false, &[0; 4]);
+    wav[20] = 2; // ADPCM
+    assert!(read_header(&mut &wav[..]).is_err());
 }
