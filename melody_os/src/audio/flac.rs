@@ -1,5 +1,6 @@
-//! FLAC decoder (integer only): CONSTANT / VERBATIM / FIXED subframes, Rice and Rice2
-//! residuals with escape codes, wasted bits. Up to 24 bits per sample.
+//! FLAC decoder (integer only). Supports everything the reference encoder produces:
+//! CONSTANT / VERBATIM / FIXED / LPC subframes, Rice and Rice2 residuals with escape codes,
+//! wasted bits, and left/side, right/side and mid/side stereo. Up to 24 bits per sample.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -243,16 +244,35 @@ fn decode_frame(b: &mut Bits<'_>, stream_rate: u32, stream_bps: u8, chans: &mut 
 
     let nch = match ch_code {
         0..=7 => ch_code as usize + 1,
-        8..=10 => return Err("FLAC stereo decorrelation not supported yet"),
+        8..=10 => 2,
         _ => return Err("reserved FLAC channel assignment"),
     };
     if chans.len() < nch {
         chans.resize_with(nch, Vec::new);
     }
-    for out in chans.iter_mut().take(nch) {
+    for (ch, out) in chans.iter_mut().enumerate().take(nch) {
+        let side = matches!((ch_code, ch), (8, 1) | (9, 0) | (10, 1));
         out.clear();
         out.resize(block, 0);
-        decode_subframe(b, bps, out)?;
+        decode_subframe(b, bps + side as u32, out)?;
+    }
+
+    // Undo stereo decorrelation.
+    if ch_code >= 8 {
+        let (a, rest) = chans.split_at_mut(1);
+        let (c0, c1) = (&mut a[0], &mut rest[0]);
+        for i in 0..block {
+            let (x, y) = (c0[i], c1[i]);
+            match ch_code {
+                8 => c1[i] = x - y,     // left, side -> right
+                9 => c0[i] = x + y,     // side, right -> left
+                _ => {
+                    let mid = (x << 1) | (y & 1);
+                    c0[i] = (mid + y) >> 1;
+                    c1[i] = (mid - y) >> 1;
+                }
+            }
+        }
     }
 
     b.align();
@@ -295,7 +315,32 @@ fn decode_subframe(b: &mut Bits<'_>, mut bps: u32, out: &mut [i32]) -> Result<()
                 out[i] = (out[i] as i64 + p) as i32;
             }
         }
-        32..=63 => return Err("FLAC LPC subframes not supported yet"),
+        32..=63 => {
+            let order = (kind - 31) as usize;
+            for s in out.iter_mut().take(order) {
+                *s = b.read_signed(bps)?;
+            }
+            let precision = b.read(4)? + 1;
+            if precision == 16 {
+                return Err("corrupt FLAC LPC precision");
+            }
+            let shift = b.read_signed(5)?;
+            if shift < 0 {
+                return Err("negative FLAC LPC shift");
+            }
+            let mut coefs = [0i64; 32];
+            for c in coefs.iter_mut().take(order) {
+                *c = b.read_signed(precision)? as i64;
+            }
+            residual(b, order, out)?;
+            for i in order..out.len() {
+                let mut sum: i64 = 0;
+                for (j, c) in coefs.iter().enumerate().take(order) {
+                    sum += c * out[i - 1 - j] as i64;
+                }
+                out[i] = (out[i] as i64 + (sum >> shift)) as i32;
+            }
+        }
         _ => return Err("reserved FLAC subframe type"),
     }
 
