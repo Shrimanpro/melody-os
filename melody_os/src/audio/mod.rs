@@ -1,5 +1,6 @@
 //! Audio pipeline: file bytes -> decoder -> 32-bit stereo samples -> packer -> HDA ring.
 
+pub mod flac;
 pub mod hda;
 pub mod wav;
 
@@ -135,9 +136,10 @@ pub trait Decoder: Send {
     fn decode(&mut self, input: &mut dyn ByteRead, out: &mut Vec<i32>) -> Result<bool, &'static str>;
 }
 
-pub fn open_decoder(kind: AudioKind, input: &mut dyn ByteRead, _file_size: u64) -> Result<Box<dyn Decoder>, &'static str> {
+pub fn open_decoder(kind: AudioKind, input: &mut dyn ByteRead, file_size: u64) -> Result<Box<dyn Decoder>, &'static str> {
     match kind {
         AudioKind::Wav => Ok(Box::new(wav::WavDecoder::open(input)?)),
+        AudioKind::Flac => Ok(Box::new(flac::FlacDecoder::open(input, file_size)?)),
         _ => Err("format not supported yet"),
     }
 }
