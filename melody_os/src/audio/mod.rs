@@ -2,6 +2,7 @@
 
 pub mod flac;
 pub mod hda;
+pub mod mp3;
 pub mod wav;
 
 use alloc::boxed::Box;
@@ -140,7 +141,7 @@ pub fn open_decoder(kind: AudioKind, input: &mut dyn ByteRead, file_size: u64) -
     match kind {
         AudioKind::Wav => Ok(Box::new(wav::WavDecoder::open(input)?)),
         AudioKind::Flac => Ok(Box::new(flac::FlacDecoder::open(input, file_size)?)),
-        _ => Err("format not supported yet"),
+        AudioKind::Mp3 => Ok(Box::new(mp3::Mp3Decoder::open(input, file_size)?)),
     }
 }
 

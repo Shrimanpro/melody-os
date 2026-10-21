@@ -134,6 +134,7 @@ dependencies = [
  "bootloader",
  "lazy_static",
  "linked_list_allocator",
+ "nanomp3",
  "pic8259",
  "smoltcp",
  "spin 0.5.2",
@@ -141,6 +142,21 @@ dependencies = [
  "volatile 0.2.6",
  "x86_64",
 ]
+
+[[package]]
+name = "nanomp3"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acd9a8d0592a17ee5211aae2f976e6dc2f6846135d1f49665b3f19a7afd23435"
+dependencies = [
+ "nanomp3-core",
+]
+
+[[package]]
+name = "nanomp3-core"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63fa2238e662d3d3c1a71168b3278f23422cf9bf76f6943ee6b1c2581d74eb5c"
 
 [[package]]
 name = "pic8259"
