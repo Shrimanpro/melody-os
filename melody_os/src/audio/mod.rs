@@ -3,6 +3,7 @@
 pub mod flac;
 pub mod hda;
 pub mod mp3;
+pub mod player;
 pub mod wav;
 
 use alloc::boxed::Box;

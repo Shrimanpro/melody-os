@@ -11,7 +11,10 @@ use alloc::vec;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 use melody_os::vga_buffer::{print_colored, Color};
-use melody_os::{audio, fs, net, pci, println, serial_println, usb};
+use alloc::vec::Vec;
+use melody_os::audio::hda::HdaController;
+use melody_os::audio::player::{Library, Player, PLAYER};
+use melody_os::{fs, net, pci, println, serial_println, usb};
 
 entry_point!(kernel_main);
 
@@ -33,8 +36,6 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         serial_println!("PCI: {}", dev);
     }
 
-    // Locate Audio and Network controllers
-    let hda_dev = pci::find_hda_controllers(&pci_devices).into_iter().next();
     let nic_dev = pci::find_network_controller(&pci_devices);
 
     // 4. Step 2 & 3: USB storage and the music library
@@ -43,35 +44,41 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     println!("[OK] {} USB storage drive(s)", drives.len());
 
     println!("\n[3/5] Music library (FAT32 / FAT16)...");
-    let mut found = false;
+    let mut library: Option<Library> = None;
     for mut drive in drives {
         match fs::find_fat_volume(&mut drive) {
             Ok(mut fat) => {
                 let tracks = fs::scan_library(&mut fat, &mut drive);
                 println!("[OK] {} tracks on {} ({})", tracks.len(), drive.model, fat.type_name());
-                found = true;
+                library = Some(Library { drive, fs: fat, tracks });
                 break;
             }
             Err(e) => println!("[WARN] {}: {}", drive.model, e),
         }
     }
-    if !found {
+    if library.is_none() {
         println!("[WARN] no music found (put .wav/.flac/.mp3 files on a FAT32 USB stick)");
     }
 
     // 5. Step 4: Intel HDA sound
     println!("\n[4/5] Sound (Intel HDA)...");
-    if let Some(ref dev) = hda_dev {
-        match unsafe { audio::hda::HdaController::new(dev) } {
+    let mut hdas: Vec<HdaController> = Vec::new();
+    for dev in pci::find_hda_controllers(&pci_devices) {
+        match unsafe { HdaController::new(&dev) } {
             Ok(hda) => {
-                let outs: alloc::vec::Vec<&str> = hda.available_outputs().iter().map(|o| o.name()).collect();
+                let outs: Vec<&str> = hda.available_outputs().iter().map(|o| o.name()).collect();
                 println!("[OK] HDA at {}: {} ({})", dev.address, outs.join(", "), hda.active_pins());
+                hdas.push(hda);
             }
             Err(e) => println!("[WARN] HDA at {}: {}", dev.address, e),
         }
-    } else {
+    }
+    if hdas.is_empty() {
         println!("[WARN] no HD Audio controller found");
     }
+
+    let have_tracks = library.as_ref().map(|l| !l.tracks.is_empty()).unwrap_or(false);
+    *PLAYER.lock() = Some(Player::new(hdas, library));
 
     // 6. Step 5: Network Driver & MPD Protocol Server
     println!("\n[5/5] Initializing Network & MPD Server...");
@@ -104,7 +111,17 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     test_main();
 
     println!("\nMelody OS is running. Enjoy the music!");
-    melody_os::hlt_loop();
+    if have_tracks {
+        if let Some(player) = PLAYER.lock().as_mut() {
+            player.play(0);
+        }
+    }
+    loop {
+        if let Some(player) = PLAYER.lock().as_mut() {
+            player.poll();
+        }
+        x86_64::instructions::hlt();
+    }
 }
 
 /// This function is called on panic.
