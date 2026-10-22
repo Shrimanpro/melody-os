@@ -277,9 +277,19 @@ impl Player {
         };
         let info = decoder.info();
 
+        // Find a rate the codec accepts: native, or 2x/4x downsampled for hi-res files.
         let hda = &mut self.hdas[out.ctrl];
-        let fmt = hda.negotiate(info.sample_rate, info.bits)?;
-        let decimate = 1;
+        let mut chosen = None;
+        for d in [1u32, 2, 4] {
+            if info.sample_rate % d != 0 {
+                continue;
+            }
+            if let Ok(f) = hda.negotiate(info.sample_rate / d, info.bits) {
+                chosen = Some((f, d as usize));
+                break;
+            }
+        }
+        let (fmt, decimate) = chosen.ok_or("sample rate not supported by the sound chip")?;
         hda.prepare(fmt)?;
 
         let soft_volume = if hda.has_hw_volume() { None } else if self.muted { Some(0) } else { Some(self.volume) };
