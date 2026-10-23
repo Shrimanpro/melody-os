@@ -183,6 +183,13 @@ impl Player {
             self.current = None;
         }
         self.output = Some(idx);
+        if new.kind == OutputKind::Digital {
+            // HDMI only carries sound once the graphics side is in HDMI mode.
+            match crate::gpu::enable_hdmi_audio() {
+                Ok(()) => crate::println!("[gpu] HDMI audio enabled: {}", crate::gpu::status()),
+                Err(e) => crate::println!("HDMI audio not enabled: {}", e),
+            }
+        }
         let (vol, muted) = (self.volume, self.muted);
         let h = &mut self.hdas[new.ctrl];
         h.set_output(new.kind);

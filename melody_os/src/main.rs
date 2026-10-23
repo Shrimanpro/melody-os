@@ -77,6 +77,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         println!("[WARN] no HD Audio controller found");
     }
 
+    match melody_os::gpu::init(&pci_devices) {
+        Some(line) => println!("[OK] Graphics (HDMI): {}", line),
+        None => println!("[WARN] no Intel G4x graphics (HDMI audio unavailable)"),
+    }
+
     let have_tracks = library.as_ref().map(|l| !l.tracks.is_empty()).unwrap_or(false);
     *PLAYER.lock() = Some(Player::new(hdas, library));
 

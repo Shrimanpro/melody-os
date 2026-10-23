@@ -14,6 +14,7 @@ pub mod allocator;
 pub mod audio;
 pub mod fs;
 pub mod gdt;
+pub mod gpu;
 pub mod interrupts;
 pub mod keyboard;
 pub mod memory;
