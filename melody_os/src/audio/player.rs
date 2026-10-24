@@ -187,7 +187,7 @@ impl Player {
             // HDMI only carries sound once the graphics side is in HDMI mode.
             match crate::gpu::enable_hdmi_audio() {
                 Ok(()) => crate::println!("[gpu] HDMI audio enabled: {}", crate::gpu::status()),
-                Err(e) => crate::println!("HDMI audio not enabled: {}", e),
+                Err(e) => crate::ui::notify(alloc::format!("HDMI audio not enabled: {}", e)),
             }
         }
         let (vol, muted) = (self.volume, self.muted);
@@ -195,7 +195,7 @@ impl Player {
         h.set_output(new.kind);
         h.set_volume(vol, muted);
         self.update_soft_volume();
-        crate::println!("Output: {}", new.kind.name());
+        crate::ui::notify(alloc::format!("Output: {}", new.kind.name()));
         if self.current.is_none() {
             if let Some(i) = resume {
                 self.play(i);
@@ -209,7 +209,7 @@ impl Player {
             let next = self.output.map(|i| (i + 1) % self.outputs.len()).unwrap_or(0);
             self.select_output(next);
         } else {
-            crate::println!("Only one audio output available");
+            crate::ui::notify("Only one audio output available".into());
         }
     }
 
@@ -256,11 +256,12 @@ impl Player {
             Ok(()) => {
                 self.state = PlayState::Playing;
                 let name = String::from(self.tracks()[idx].title());
-                crate::println!("Playing: {}", name);
+                crate::ui::notify(alloc::format!("Playing: {}", name));
             }
             Err(e) => {
                 let name = String::from(self.tracks()[idx].file_name());
                 crate::println!("[player] cannot play {}: {}", name, e);
+                crate::ui::notify(alloc::format!("Can't play {}: {}", name, e));
                 self.current = None;
                 self.state = PlayState::Stopped;
                 if let Some(h) = self.hda() {
@@ -367,6 +368,7 @@ impl Player {
                 Ok(false) => cur.eof = true,
                 Err(e) => {
                     crate::println!("[player] decode error: {}", e);
+                    crate::ui::notify(alloc::format!("Read/decode error: {}", e));
                     cur.eof = true;
                     return false;
                 }

@@ -6,7 +6,7 @@
 
 extern crate alloc;
 
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
@@ -14,7 +14,7 @@ use melody_os::vga_buffer::{print_colored, Color};
 use alloc::vec::Vec;
 use melody_os::audio::hda::HdaController;
 use melody_os::audio::player::{Library, Player, PLAYER};
-use melody_os::{fs, net, pci, println, serial_println, usb};
+use melody_os::{fs, net, pci, println, serial_println, ui, usb};
 
 entry_point!(kernel_main);
 
@@ -41,6 +41,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // 4. Step 2 & 3: USB storage and the music library
     println!("\n[2/5] USB controllers and drives...");
     let drives = usb::scan(&pci_devices);
+    let usb_drives: Vec<String> = drives.iter().map(|d| alloc::format!("{} {}MB", d.model, d.capacity_mb)).collect();
     println!("[OK] {} USB storage drive(s)", drives.len());
 
     println!("\n[3/5] Music library (FAT32 / FAT16)...");
@@ -83,6 +84,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     let have_tracks = library.as_ref().map(|l| !l.tracks.is_empty()).unwrap_or(false);
+    let storage = match &library {
+        Some(l) => alloc::format!("{} ({})", l.drive.model, l.fs.type_name()),
+        None => String::from("no USB stick"),
+    };
     *PLAYER.lock() = Some(Player::new(hdas, library));
 
     // 6. Step 5: Network Driver & MPD Protocol Server
@@ -115,15 +120,17 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     #[cfg(test)]
     test_main();
 
-    println!("\nMelody OS is running. Enjoy the music!");
+    println!("\nStarting player...");
+    let mhz = melody_os::interrupts::TSC_CYCLES_PER_MS.load(core::sync::atomic::Ordering::Relaxed) / 1000;
+    melody_os::interrupts::delay_ms(3000); // leave the boot log readable for a moment
+    ui::start(ui::BootInfo { storage, cpu_mhz: mhz, usb_drives });
     if have_tracks {
-        if let Some(player) = PLAYER.lock().as_mut() {
-            player.play(0);
-        }
+        ui::notify(String::from("Ready. Pick a track and press ENTER"));
     }
     loop {
         if let Some(player) = PLAYER.lock().as_mut() {
             player.poll();
+            ui::render(player);
         }
         x86_64::instructions::hlt();
     }

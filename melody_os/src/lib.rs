@@ -21,6 +21,7 @@ pub mod memory;
 pub mod net;
 pub mod pci;
 pub mod serial;
+pub mod ui;
 pub mod usb;
 pub mod vga_buffer;
 
