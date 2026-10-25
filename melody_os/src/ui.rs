@@ -66,6 +66,9 @@ struct Ui {
     shown: Frame,
     cursor: usize,
     scroll: usize,
+    diag: bool,
+    /// Boot log view: Some(lines scrolled up from the bottom).
+    boot_log: Option<usize>,
     last_track: Option<usize>,
     last_draw_ms: u64,
     last_version: u32,
@@ -84,6 +87,8 @@ pub fn start(boot: BootInfo) {
         shown: [[poison; W]; H],
         cursor: 0,
         scroll: 0,
+        diag: false,
+        boot_log: None,
         last_track: None,
         last_draw_ms: 0,
         last_version: u32::MAX,
@@ -96,13 +101,26 @@ pub fn handle_key(key: Key, player: &mut Player) {
     let mut guard = UI.lock();
     let Some(ui) = guard.as_mut() else { return };
     let count = player.track_count();
+    if let Some(scroll) = ui.boot_log.as_mut() {
+        match key {
+            Key::Up => *scroll += 1,
+            Key::Down => *scroll = scroll.saturating_sub(1),
+            Key::PageUp => *scroll += 20,
+            Key::PageDown => *scroll = scroll.saturating_sub(20),
+            _ => ui.boot_log = None,
+        }
+        ui.dirty = true;
+        return;
+    }
     match key {
         Key::Up => ui.cursor = ui.cursor.saturating_sub(1),
         Key::Down => ui.cursor = (ui.cursor + 1).min(count.saturating_sub(1)),
         Key::PageUp => ui.cursor = ui.cursor.saturating_sub(LIST_ROWS),
         Key::PageDown => ui.cursor = (ui.cursor + LIST_ROWS).min(count.saturating_sub(1)),
         Key::Enter => {
-            if count > 0 {
+            if ui.diag {
+                ui.diag = false;
+            } else if count > 0 {
                 player.play(ui.cursor);
             }
         }
@@ -114,7 +132,8 @@ pub fn handle_key(key: Key, player: &mut Player) {
         Key::VolDown => player.change_volume(-5),
         Key::Mute => player.toggle_mute(),
         Key::Output => player.cycle_output(),
-        Key::Diagnostics | Key::BootLog => {}
+        Key::Diagnostics => ui.diag = !ui.diag,
+        Key::BootLog => ui.boot_log = Some(0),
     }
     ui.dirty = true;
 }
@@ -142,11 +161,19 @@ pub fn render(player: &Player) {
     }
 
     ui.clear();
+    if let Some(scroll) = ui.boot_log {
+        ui.draw_boot_log(scroll);
+    } else {
     ui.draw_header();
     ui.draw_now_playing(player, &status);
     ui.rule(LIST_TOP + LIST_ROWS + 1, "");
-    ui.draw_library(player, &status);
+    if ui.diag {
+        ui.draw_diagnostics(player, &status);
+    } else {
+        ui.draw_library(player, &status);
+    }
     ui.draw_footer(now);
+    }
 
     let (frame, shown) = (&ui.frame, &mut ui.shown);
     x86_64::instructions::interrupts::without_interrupts(|| WRITER.lock().blit(frame, shown));
@@ -370,6 +397,56 @@ impl Ui {
         }
     }
 
+    /// Full-screen view of everything printed during boot (L key).
+    fn draw_boot_log(&mut self, scroll: usize) {
+        let log = crate::vga_buffer::boot_log();
+        let mut lines: Vec<&str> = Vec::new();
+        for l in log.lines() {
+            let mut rest = l;
+            while rest.len() > W {
+                let cut = rest.char_indices().nth(W).map(|(i, _)| i).unwrap_or(rest.len());
+                lines.push(&rest[..cut]);
+                rest = &rest[cut..];
+            }
+            lines.push(rest);
+        }
+        let rows = H - 1;
+        let end = lines.len().saturating_sub(scroll.min(lines.len().saturating_sub(rows)));
+        let start = end.saturating_sub(rows);
+        for (row, line) in lines[start..end].iter().enumerate() {
+            let color = if line.contains("[WARN]") { WARN } else if line.contains("[ OK ]") { GOOD } else { TEXT };
+            self.text(row, 0, line, color, W);
+        }
+        self.fill(H - 1, 0, W, b' ', BAR);
+        self.text(H - 1, 1, "BOOT LOG   Up/Down/PgUp/PgDn scroll   any other key returns", BAR, W - 2);
+    }
+
+    fn draw_diagnostics(&mut self, player: &Player, s: &Status) {
+        self.rule(LIST_TOP, "Hardware info (press D to close)");
+        let mut y = LIST_TOP + 1;
+        let mut line = |ui: &mut Ui, label: &str, value: String, color: ColorCode| {
+            if y < LIST_TOP + LIST_ROWS + 1 {
+                ui.text(y, 2, label, DIM, 16);
+                ui.text(y, 19, &value, color, W - 21);
+                y += 1;
+            }
+        };
+
+        line(self, "CPU clock", fmt!("{} MHz (TSC)", self.boot.cpu_mhz), TEXT);
+        for ((v, d), codecs) in player.hda_summary() {
+            let ids: Vec<String> = codecs.iter().map(|c| fmt!("{:04x}:{:04x}", c >> 16, c & 0xFFFF)).collect();
+            line(self, "Sound chip", fmt!("HDA {:04x}:{:04x}  codecs {}", v, d, ids.join(" ")), TEXT);
+        }
+        let outs: Vec<&str> = s.outputs.iter().map(|o| o.kind.name()).collect();
+        line(self, "Outputs", if outs.is_empty() { String::from("none") } else { outs.join(", ") }, TEXT);
+        line(self, "Active pins", if s.output_pins.is_empty() { String::from("-") } else { s.output_pins.clone() }, TEXT);
+        line(self, "DMA position", fmt!("{:#07x}", s.lpib), TEXT);
+        line(self, "HDMI (GPU)", crate::gpu::status(), TEXT);
+        let drives = if self.boot.usb_drives.is_empty() { String::from("none") } else { self.boot.usb_drives.join(", ") };
+        line(self, "USB drives", drives, TEXT);
+        line(self, "USB keyboards", fmt!("{}", crate::usb::keyboard_count()), TEXT);
+    }
+
     fn draw_footer(&mut self, now: u64) {
         if let Some(e) = EVENT.lock().as_ref() {
             let age = (now.saturating_sub(e.at_ms)) / 1000;
@@ -377,7 +454,7 @@ impl Ui {
             self.put(23, 1, G_DOT, color);
             self.text(23, 3, &e.text, color, W - 4);
         }
-        let help = " SPACE play/pause  N/P next/prev  ENTER play  +/- vol  M mute  O out";
+        let help = " SPACE play/pause  N/P next/prev  ENTER play  +/- vol  M mute  O out  D/L info/log";
         self.text(24, 0, help, DIM, W);
     }
 }
