@@ -120,20 +120,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     #[cfg(test)]
     test_main();
 
-    println!("\nStarting player...");
+    println!("\nStarting player... (press L in the player to see this log again)");
     let mhz = melody_os::interrupts::TSC_CYCLES_PER_MS.load(core::sync::atomic::Ordering::Relaxed) / 1000;
     melody_os::interrupts::delay_ms(3000); // leave the boot log readable for a moment
     ui::start(ui::BootInfo { storage, cpu_mhz: mhz, usb_drives });
     if have_tracks {
         ui::notify(String::from("Ready. Pick a track and press ENTER"));
     }
-    loop {
-        if let Some(player) = PLAYER.lock().as_mut() {
-            player.poll();
-            ui::render(player);
-        }
-        x86_64::instructions::hlt();
-    }
+    melody_os::run();
 }
 
 /// This function is called on panic.

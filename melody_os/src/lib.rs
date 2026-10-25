@@ -97,6 +97,65 @@ pub fn exit_qemu(exit_code: QemuExitCode) {
     }
 }
 
+/// Read one byte from COM1 if the terminal typed something.
+fn poll_serial_byte() -> Option<u8> {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        if Port::<u8>::new(0x3FD).read() & 0x01 != 0 {
+            Some(Port::<u8>::new(0x3F8).read())
+        } else {
+            None
+        }
+    }
+}
+
+/// The one and only main loop: input, audio, network and screen, in turn, forever.
+pub fn run() -> ! {
+    use audio::player::PLAYER;
+    use keyboard::{Key, Ps2Decoder, SerialDecoder};
+
+    let mut ps2 = Ps2Decoder::new();
+    let mut serial = SerialDecoder::new();
+    let serial_present = serial::is_present();
+    let mut keys: alloc::vec::Vec<Key> = alloc::vec::Vec::with_capacity(16);
+
+    loop {
+        keys.clear();
+        while let Some(code) = interrupts::pop_scancode() {
+            keys.extend(ps2.feed(code));
+        }
+        if serial_present {
+            while let Some(b) = poll_serial_byte() {
+                keys.extend(serial.feed(b));
+            }
+        }
+        usb::poll_usb_keyboards(|k| keys.push(k));
+
+        {
+            let mut guard = PLAYER.lock();
+            if let Some(player) = guard.as_mut() {
+                for &k in &keys {
+                    ui::handle_key(k, player);
+                }
+                player.poll();
+            }
+        }
+
+        {
+            let mut guard = PLAYER.lock();
+            if let Some(player) = guard.as_mut() {
+                player.poll();
+                ui::render(player);
+            }
+        }
+
+        if timer_works() {
+            // Sleep until the next interrupt (at most 1 ms with the 1 kHz PIT).
+            x86_64::instructions::hlt();
+        }
+    }
+}
+
 pub fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
