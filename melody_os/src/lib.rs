@@ -141,6 +141,8 @@ pub fn run() -> ! {
             }
         }
 
+        net::poll();
+
         {
             let mut guard = PLAYER.lock();
             if let Some(player) = guard.as_mut() {

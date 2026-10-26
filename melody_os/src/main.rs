@@ -6,8 +6,7 @@
 
 extern crate alloc;
 
-use alloc::string::{String, ToString};
-use alloc::vec;
+use alloc::string::String;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 use melody_os::vga_buffer::{print_colored, Color};
@@ -19,13 +18,10 @@ use melody_os::{fs, net, pci, println, serial_println, ui, usb};
 entry_point!(kernel_main);
 
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
-    use x86_64::VirtAddr;
-
     print_colored(Color::LightCyan, format_args!("Melody OS {} - booting\n\n", env!("CARGO_PKG_VERSION")));
 
     // 1. GDT, IDT, PICs, timer, paging and heap
     melody_os::init_with_memory(boot_info);
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
     println!("[OK] Memory & Heap Allocator Initialized");
 
     // 3. Step 1: PCI Bus Enumeration
@@ -36,7 +32,6 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         serial_println!("PCI: {}", dev);
     }
 
-    let nic_dev = pci::find_network_controller(&pci_devices);
 
     // 4. Step 2 & 3: USB storage and the music library
     println!("\n[2/5] USB controllers and drives...");
@@ -90,32 +85,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     };
     *PLAYER.lock() = Some(Player::new(hdas, library));
 
-    // 6. Step 5: Network Driver & MPD Protocol Server
-    println!("\n[5/5] Initializing Network & MPD Server...");
-    if let Some(ref dev) = nic_dev {
-        println!("Found Network Controller at {}", dev.address);
-        match unsafe { net::e1000::E1000Driver::new(dev, phys_mem_offset) } {
-            Ok(driver) => {
-                println!(
-                    "[OK] E1000 Ethernet Driver initialized (MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-                    driver.mac_addr[0], driver.mac_addr[1], driver.mac_addr[2],
-                    driver.mac_addr[3], driver.mac_addr[4], driver.mac_addr[5]
-                );
-            }
-            Err(e) => println!("[WARN] E1000 init error: {}", e),
-        }
-    } else {
-        println!("[INFO] No supported Ethernet NIC found");
+    println!("\n[5/5] Network...");
+    match net::init(&pci_devices) {
+        Ok(desc) => println!("[OK] {}", desc),
+        Err(e) => println!("[WARN] {}", e),
     }
-
-    let mut mpd = net::mpd::MpdServer::new();
-    mpd.set_playlist(vec![
-        "track_01_bach.wav".to_string(),
-        "track_02_chopin.flac".to_string(),
-        "track_03_miles_davis.mp3".to_string(),
-    ]);
-    println!("[OK] MPD Protocol Server active on TCP port 6600");
-    println!("     Status: Ready for music streaming commands");
 
     #[cfg(test)]
     test_main();
