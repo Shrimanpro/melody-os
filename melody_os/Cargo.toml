@@ -21,7 +21,15 @@ x86_64 = "0.15.5"
 uart_16550 = "0.6.0"
 pic8259 = "0.11.0"
 linked_list_allocator = "0.9.0"
-smoltcp = { version = "0.14.0", default-features = false, features = ["alloc", "proto-ipv4", "socket-tcp", "medium-ethernet"] }
+smoltcp = { version = "0.14.0", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-tcp",
+    "socket-dhcpv4",
+    "auto-icmp-echo-reply",
+] }
 
 # MP3 decoding (pure Rust port of minimp3, no_std).
 nanomp3 = { version = "0.2.0", default-features = false }

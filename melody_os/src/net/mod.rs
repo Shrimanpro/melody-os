@@ -1,17 +1,18 @@
-//! Networking: Intel e1000 or Realtek 8168 NIC + smoltcp with a static IPv4 address.
+//! Networking: Intel e1000 or Realtek 8168 NIC + smoltcp (DHCP, ARP, ICMP echo).
+//!
+//! The IP shown on screen is only ever the address DHCP actually leased to us, and the
+//! same address smoltcp answers ARP and ping for.
 
 pub mod e1000;
 pub mod mpd;
 pub mod rtl8168;
 
-pub const STATIC_IP: [u8; 4] = [192, 168, 1, 100];
-pub const GATEWAY_IP: [u8; 4] = [192, 168, 1, 1];
-
 use alloc::vec;
 use alloc::vec::Vec;
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::time::Instant;
+use smoltcp::socket::dhcpv4;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use spin::Mutex;
 
@@ -60,8 +61,10 @@ pub struct Net {
     nic: Nic,
     iface: Interface,
     sockets: SocketSet<'static>,
+    dhcp: SocketHandle,
     ip: Option<Ipv4Cidr>,
     gateway: Option<Ipv4Address>,
+    dhcp_since_ms: u64,
 }
 
 pub static NET: Mutex<Option<Net>> = Mutex::new(None);
@@ -148,15 +151,12 @@ pub fn init(pci_devices: &[PciDevice]) -> Result<alloc::string::String, &'static
 
     let mut config = Config::new(EthernetAddress(mac).into());
     config.random_seed = crate::interrupts::rdtsc();
-    let mut iface = Interface::new(config, &mut nic, now());
+    let iface = Interface::new(config, &mut nic, now());
 
-    let ip = Ipv4Cidr::new(Ipv4Address::new(STATIC_IP[0], STATIC_IP[1], STATIC_IP[2], STATIC_IP[3]), 24);
-    let gateway = Ipv4Address::new(GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3]);
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::Ipv4(ip));
-    });
-    let _ = iface.routes_mut().add_default_ipv4_route(gateway);
-    let sockets = SocketSet::new(Vec::new());
+    let mut sockets = SocketSet::new(Vec::new());
+    let mut dhcp_socket = dhcpv4::Socket::new();
+    dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(3600)));
+    let dhcp = sockets.add(dhcp_socket);
 
     let desc = alloc::format!(
         "{} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -166,8 +166,10 @@ pub fn init(pci_devices: &[PciDevice]) -> Result<alloc::string::String, &'static
         nic,
         iface,
         sockets,
-        ip: Some(ip),
-        gateway: Some(gateway),
+        dhcp,
+        ip: None,
+        gateway: None,
+        dhcp_since_ms: crate::interrupts::now_ms(),
     });
     Ok(desc)
 }
@@ -177,4 +179,37 @@ pub fn poll() {
     let Some(net) = guard.as_mut() else { return };
     let ts = now();
     net.iface.poll(ts, &mut net.nic, &mut net.sockets);
+
+    match net.sockets.get_mut::<dhcpv4::Socket>(net.dhcp).poll() {
+        Some(dhcpv4::Event::Configured(cfg)) => {
+            net.iface.update_ip_addrs(|addrs| {
+                addrs.clear();
+                let _ = addrs.push(IpCidr::Ipv4(cfg.address));
+            });
+            match cfg.router {
+                Some(r) => {
+                    let _ = net.iface.routes_mut().add_default_ipv4_route(r);
+                }
+                None => {
+                    net.iface.routes_mut().remove_default_ipv4_route();
+                }
+            }
+            net.ip = Some(cfg.address);
+            net.gateway = cfg.router;
+            crate::println!("[net] DHCP lease: {} gateway {:?}", cfg.address, cfg.router);
+            crate::ui::notify(alloc::format!("Network up: {}", cfg.address.address()));
+        }
+        Some(dhcpv4::Event::Deconfigured) => {
+            // smoltcp also reports this once at startup, before any lease existed.
+            if net.ip.is_some() {
+                crate::ui::notify("Network: DHCP lease lost".into());
+            }
+            net.iface.update_ip_addrs(|addrs| addrs.clear());
+            net.iface.routes_mut().remove_default_ipv4_route();
+            net.ip = None;
+            net.gateway = None;
+            net.dhcp_since_ms = crate::interrupts::now_ms();
+        }
+        None => {}
+    }
 }
