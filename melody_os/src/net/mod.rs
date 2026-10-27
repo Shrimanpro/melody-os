@@ -1,7 +1,8 @@
-//! Networking: Intel e1000 NIC + smoltcp with a static IPv4 address.
+//! Networking: Intel e1000 or Realtek 8168 NIC + smoltcp with a static IPv4 address.
 
 pub mod e1000;
 pub mod mpd;
+pub mod rtl8168;
 
 pub const STATIC_IP: [u8; 4] = [192, 168, 1, 100];
 pub const GATEWAY_IP: [u8; 4] = [192, 168, 1, 1];
@@ -16,39 +17,42 @@ use spin::Mutex;
 
 use crate::pci::PciDevice;
 use e1000::E1000;
+use rtl8168::Rtl8168;
 
 /// The network card, whichever driver it uses.
 pub enum Nic {
     Intel(E1000),
+    Realtek(Rtl8168),
 }
 
 impl Nic {
     fn mac(&self) -> [u8; 6] {
-        match self { Nic::Intel(n) => n.mac }
+        match self { Nic::Intel(n) => n.mac, Nic::Realtek(n) => n.mac }
     }
     fn receive(&mut self, out: &mut [u8]) -> Option<usize> {
-        match self { Nic::Intel(n) => n.receive(out) }
+        match self { Nic::Intel(n) => n.receive(out), Nic::Realtek(n) => n.receive(out) }
     }
     fn tx_ready(&self) -> bool {
-        match self { Nic::Intel(n) => n.tx_ready() }
+        match self { Nic::Intel(n) => n.tx_ready(), Nic::Realtek(n) => n.tx_ready() }
     }
     fn transmit(&mut self, len: usize, fill: &mut dyn FnMut(&mut [u8])) -> bool {
-        match self { Nic::Intel(n) => n.transmit(len, |b| fill(b)) }
+        match self { Nic::Intel(n) => n.transmit(len, |b| fill(b)), Nic::Realtek(n) => n.transmit(len, fill) }
     }
     fn link_up(&self) -> bool {
-        match self { Nic::Intel(n) => n.link_up() }
+        match self { Nic::Intel(n) => n.link_up(), Nic::Realtek(n) => n.link_up() }
     }
     fn speed(&self) -> u32 {
-        match self { Nic::Intel(n) => n.speed() }
+        match self { Nic::Intel(n) => n.speed(), Nic::Realtek(n) => n.speed() }
     }
     /// Chip-specific details for the hardware info page.
     fn details(&self) -> alloc::string::String {
         match self {
             Nic::Intel(n) => alloc::format!("Intel {:04x}{}", n.device_id, if n.ich { " ICH LAN" } else { "" }),
+            Nic::Realtek(n) => n.debug_state(),
         }
     }
     fn packets(&self) -> (u64, u64) {
-        match self { Nic::Intel(n) => (n.rx_packets, n.tx_packets) }
+        match self { Nic::Intel(n) => (n.rx_packets, n.tx_packets), Nic::Realtek(n) => (n.rx_packets, n.tx_packets) }
     }
 }
 
@@ -133,6 +137,10 @@ pub fn init(pci_devices: &[PciDevice]) -> Result<alloc::string::String, &'static
         let n = unsafe { E1000::new(&dev)? };
         let chip = alloc::format!("Intel {:04x}{}{}", n.device_id, if n.ich { " (ICH LAN)" } else { "" }, if n.mac_from_nvm { "" } else { " (fallback MAC)" });
         (Nic::Intel(n), chip)
+    } else if Rtl8168::is_supported(&dev) {
+        let n = unsafe { Rtl8168::new(&dev)? };
+        let chip = alloc::format!("Realtek {:04x} ({} xid {:#x})", n.device_id, n.family(), n.xid >> 20);
+        (Nic::Realtek(n), chip)
     } else {
         return Err("no driver for this Ethernet chip");
     };
