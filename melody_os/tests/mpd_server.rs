@@ -6,27 +6,19 @@
 
 extern crate alloc;
 
-use alloc::string::ToString;
-use alloc::vec;
-use bootloader::{BootInfo, entry_point};
+use alloc::string::String;
+use alloc::vec::Vec;
+use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
-use melody_os::net::mpd::{MpdPlaybackState, MpdServer};
+use melody_os::audio::player::Player;
+use melody_os::net::mpd::{Client, GREETING};
 
 entry_point!(main);
 
 fn main(boot_info: &'static BootInfo) -> ! {
-    use melody_os::allocator;
-    use melody_os::memory::{self, BootInfoFrameAllocator};
-    use x86_64::VirtAddr;
-
-    melody_os::init();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
-    let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
-    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
-
+    melody_os::init_with_memory(boot_info);
     test_main();
-    loop {}
+    melody_os::hlt_loop();
 }
 
 #[panic_handler]
@@ -34,39 +26,38 @@ fn panic(info: &PanicInfo) -> ! {
     melody_os::test_panic_handler(info)
 }
 
+/// Send one chunk of protocol text and return what the server answered.
+fn exchange(client: &mut Client, player: &mut Player, input: &str) -> String {
+    client.out.clear();
+    client.feed(input.as_bytes(), player);
+    String::from_utf8(core::mem::take(&mut client.out)).unwrap()
+}
+
 #[test_case]
-fn test_mpd_commands() {
-    let mut server = MpdServer::new();
-    assert_eq!(server.welcome_banner(), "OK MPD 0.23.5\n");
+fn greets_and_reports_status() {
+    let mut player = Player::new(Vec::new(), None);
+    let mut client = Client::new();
+    assert_eq!(&client.out[..], GREETING);
+    let resp = exchange(&mut client, &mut player, "status\n");
+    assert!(resp.contains("state: stop\n"));
+    assert!(resp.contains("playlistlength: 0\n"));
+    assert!(resp.ends_with("OK\n"));
+}
 
-    // Ping
-    let res = server.handle_command("ping");
-    assert_eq!(res, "OK\n");
+#[test_case]
+fn unknown_command_is_acked() {
+    let mut player = Player::new(Vec::new(), None);
+    let mut client = Client::new();
+    let resp = exchange(&mut client, &mut player, "frobnicate\n");
+    assert!(resp.starts_with("ACK [5@0] {frobnicate}"));
+}
 
-    // Set playlist
-    server.set_playlist(vec!["track_01.wav".to_string(), "track_02.flac".to_string()]);
-
-    // Lsinfo
-    let res = server.handle_command("lsinfo");
-    assert!(res.contains("file: track_01.wav"));
-    assert!(res.contains("file: track_02.flac"));
-    assert!(res.ends_with("OK\n"));
-
-    // Status before play
-    let res = server.handle_command("status");
-    assert!(res.contains("state: stop"));
-
-    // Play
-    let res = server.handle_command("play");
-    assert_eq!(res, "OK\n");
-    assert_eq!(server.state, MpdPlaybackState::Play);
-
-    // Outputs
-    let res = server.handle_command("outputs");
-    assert!(res.contains("S/PDIF Optical"));
-
-    // Stop
-    let res = server.handle_command("stop");
-    assert_eq!(res, "OK\n");
-    assert_eq!(server.state, MpdPlaybackState::Stop);
+#[test_case]
+fn command_lists_and_volume() {
+    let mut player = Player::new(Vec::new(), None);
+    let mut client = Client::new();
+    let resp = exchange(&mut client, &mut player, "command_list_ok_begin\nsetvol 42\ngetvol\ncommand_list_end\n");
+    assert_eq!(resp, "list_OK\nvolume: 42\nlist_OK\nOK\n");
+    let resp = exchange(&mut client, &mut player, "setvol 200\n");
+    assert!(resp.starts_with("ACK [2@0]"));
 }

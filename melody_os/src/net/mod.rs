@@ -1,4 +1,5 @@
-//! Networking: Intel e1000 or Realtek 8168 NIC + smoltcp (DHCP, ARP, ICMP echo).
+//! Networking: Intel e1000 or Realtek 8168 NIC + smoltcp (DHCP, ARP, ICMP echo, TCP)
+//! + the MPD server.
 //!
 //! The IP shown on screen is only ever the address DHCP actually leased to us, and the
 //! same address smoltcp answers ARP and ping for.
@@ -11,14 +12,18 @@ use alloc::vec;
 use alloc::vec::Vec;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::dhcpv4;
+use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use spin::Mutex;
 
+use crate::audio::player::PLAYER;
 use crate::pci::PciDevice;
 use e1000::E1000;
 use rtl8168::Rtl8168;
+
+const MPD_PORT: u16 = 6600;
+const MAX_CLIENTS: usize = 4;
 
 /// The network card, whichever driver it uses.
 pub enum Nic {
@@ -62,6 +67,8 @@ pub struct Net {
     iface: Interface,
     sockets: SocketSet<'static>,
     dhcp: SocketHandle,
+    mpd: [SocketHandle; MAX_CLIENTS],
+    clients: [Option<mpd::Client>; MAX_CLIENTS],
     ip: Option<Ipv4Cidr>,
     gateway: Option<Ipv4Address>,
     dhcp_since_ms: u64,
@@ -158,6 +165,13 @@ pub fn init(pci_devices: &[PciDevice]) -> Result<alloc::string::String, &'static
     dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(3600)));
     let dhcp = sockets.add(dhcp_socket);
 
+    let mpd = core::array::from_fn(|_| {
+        let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 4096]), tcp::SocketBuffer::new(vec![0; 16384]));
+        s.set_keep_alive(Some(Duration::from_secs(30)));
+        let _ = s.listen(MPD_PORT);
+        sockets.add(s)
+    });
+
     let desc = alloc::format!(
         "{} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         chip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
@@ -167,6 +181,8 @@ pub fn init(pci_devices: &[PciDevice]) -> Result<alloc::string::String, &'static
         iface,
         sockets,
         dhcp,
+        mpd,
+        clients: Default::default(),
         ip: None,
         gateway: None,
         dhcp_since_ms: crate::interrupts::now_ms(),
@@ -211,5 +227,52 @@ pub fn poll() {
             net.dhcp_since_ms = crate::interrupts::now_ms();
         }
         None => {}
+    }
+
+    serve_mpd(net);
+    // Push any MPD responses out right away instead of waiting for the next poll.
+    net.iface.poll(now(), &mut net.nic, &mut net.sockets);
+}
+
+fn serve_mpd(net: &mut Net) {
+    let mut player_guard = PLAYER.lock();
+    let Some(player) = player_guard.as_mut() else { return };
+
+    for i in 0..MAX_CLIENTS {
+        let sock = net.sockets.get_mut::<tcp::Socket>(net.mpd[i]);
+
+        if sock.is_active() && net.clients[i].is_none() {
+            net.clients[i] = Some(mpd::Client::new());
+            if let Some(ep) = sock.remote_endpoint() {
+                crate::serial_println!("[mpd] client connected from {}", ep);
+            }
+        }
+        if !sock.is_active() {
+            net.clients[i] = None;
+            if !sock.is_open() {
+                let _ = sock.listen(MPD_PORT);
+            }
+            continue;
+        }
+        let client = net.clients[i].as_mut().unwrap();
+
+        if sock.can_recv() {
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = sock.recv_slice(&mut buf) {
+                client.feed(&buf[..n], player);
+            }
+        }
+
+        if !client.out.is_empty() && sock.can_send() {
+            if let Ok(n) = sock.send_slice(&client.out) {
+                client.out.drain(..n);
+            }
+        }
+        if client.close && client.out.is_empty() {
+            sock.close();
+        }
+        if !sock.may_recv() && sock.may_send() && client.out.is_empty() {
+            sock.close(); // peer closed its side
+        }
     }
 }
