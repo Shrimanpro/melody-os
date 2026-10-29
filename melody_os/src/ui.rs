@@ -9,6 +9,7 @@ use spin::Mutex;
 
 use crate::audio::player::{PlayState, Player, Status};
 use crate::keyboard::Key;
+use crate::net::{DhcpState, NetStatus};
 use crate::vga_buffer::{Color, ColorCode, ScreenChar, BUFFER_HEIGHT as H, BUFFER_WIDTH as W, WRITER};
 
 type Frame = [[ScreenChar; W]; H];
@@ -151,6 +152,7 @@ pub fn render(player: &Player) {
     ui.last_draw_ms = now;
 
     let status = player.status();
+    let net = crate::net::status();
 
     // Follow the playing track with the cursor when it changes.
     if status.track != ui.last_track {
@@ -164,11 +166,11 @@ pub fn render(player: &Player) {
     if let Some(scroll) = ui.boot_log {
         ui.draw_boot_log(scroll);
     } else {
-    ui.draw_header();
+    ui.draw_header(&net);
     ui.draw_now_playing(player, &status);
     ui.rule(LIST_TOP + LIST_ROWS + 1, "");
     if ui.diag {
-        ui.draw_diagnostics(player, &status);
+        ui.draw_diagnostics(player, &status, &net);
     } else {
         ui.draw_library(player, &status);
     }
@@ -206,6 +208,10 @@ fn mmss(ms: u64) -> String {
 
 fn khz(rate: u32) -> String {
     if rate % 1000 == 0 { fmt!("{} kHz", rate / 1000) } else { fmt!("{}.{} kHz", rate / 1000, rate % 1000 / 100) }
+}
+
+fn ip_str(ip: [u8; 4]) -> String {
+    fmt!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
 }
 
 impl Ui {
@@ -255,9 +261,28 @@ impl Ui {
         }
     }
 
-    fn draw_header(&mut self) {
+    fn draw_header(&mut self, net: &NetStatus) {
         self.fill(0, 0, W, b' ', BAR);
         self.text(0, 1, "MELODY OS", BAR, 20);
+
+        let (text, color) = if !net.driver {
+            match net.nic_id {
+                Some((v, d)) => (fmt!("NIC {:04x}:{:04x}: no driver", v, d), BAR),
+                None => (String::from("No network card"), BAR),
+            }
+        } else if !net.link_up {
+            (String::from("Network: no cable / no link"), BAR)
+        } else {
+            match (net.dhcp, net.ip) {
+                (DhcpState::Bound, Some(ip)) => {
+                    let mpd = if net.clients > 0 { fmt!("  MPD:{} client(s)", net.clients) } else { String::from("  MPD ready") };
+                    (fmt!("{}:6600  {}M{}", ip_str(ip), net.speed, mpd), BAR)
+                }
+                _ => (fmt!("Link {}M, asking DHCP for an address... {}s", net.speed, net.dhcp_elapsed_s), BAR_DIM),
+            }
+        };
+        let col = W.saturating_sub(text.len() + 1).max(12);
+        self.text(0, col, &text, color, W - col);
     }
 
     fn draw_now_playing(&mut self, player: &Player, s: &Status) {
@@ -421,7 +446,7 @@ impl Ui {
         self.text(H - 1, 1, "BOOT LOG   Up/Down/PgUp/PgDn scroll   any other key returns", BAR, W - 2);
     }
 
-    fn draw_diagnostics(&mut self, player: &Player, s: &Status) {
+    fn draw_diagnostics(&mut self, player: &Player, s: &Status, net: &NetStatus) {
         self.rule(LIST_TOP, "Hardware info (press D to close)");
         let mut y = LIST_TOP + 1;
         let mut line = |ui: &mut Ui, label: &str, value: String, color: ColorCode| {
@@ -442,6 +467,23 @@ impl Ui {
         line(self, "Active pins", if s.output_pins.is_empty() { String::from("-") } else { s.output_pins.clone() }, TEXT);
         line(self, "DMA position", fmt!("{:#07x}", s.lpib), TEXT);
         line(self, "HDMI (GPU)", crate::gpu::status(), TEXT);
+        match net.nic_id {
+            Some((v, d)) => line(self, "Network card", fmt!("{:04x}:{:04x}  driver {}", v, d, if net.driver { "loaded" } else { "NONE" }), if net.driver { TEXT } else { BAD }),
+            None => line(self, "Network card", String::from("not found"), BAD),
+        }
+        if net.driver {
+            let m = net.mac;
+            line(self, "MAC", fmt!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]), TEXT);
+            line(self, "Chip state", net.details.clone(), TEXT);
+            let link = if net.link_up { fmt!("up, {} Mbit/s", net.speed) } else { String::from("DOWN (check cable)") };
+            line(self, "Link", link, if net.link_up { GOOD } else { BAD });
+            let ip = match net.ip {
+                Some(ip) => fmt!("{}/{}  gateway {}", ip_str(ip), net.prefix, net.gateway.map(ip_str).unwrap_or_else(|| String::from("-"))),
+                None => fmt!("no DHCP lease yet ({}s)", net.dhcp_elapsed_s),
+            };
+            line(self, "IP address", ip, if net.ip.is_some() { GOOD } else { WARN });
+            line(self, "Packets", fmt!("rx {}  tx {}", net.rx_packets, net.tx_packets), TEXT);
+        }
         let drives = if self.boot.usb_drives.is_empty() { String::from("none") } else { self.boot.usb_drives.join(", ") };
         line(self, "USB drives", drives, TEXT);
         line(self, "USB keyboards", fmt!("{}", crate::usb::keyboard_count()), TEXT);

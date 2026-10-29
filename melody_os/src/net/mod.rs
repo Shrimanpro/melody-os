@@ -25,6 +25,31 @@ use rtl8168::Rtl8168;
 const MPD_PORT: u16 = 6600;
 const MAX_CLIENTS: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhcpState {
+    Searching,
+    Bound,
+}
+
+/// Snapshot for the UI.
+#[derive(Debug, Clone)]
+pub struct NetStatus {
+    pub nic_id: Option<(u16, u16)>,
+    pub details: alloc::string::String,
+    pub driver: bool,
+    pub link_up: bool,
+    pub speed: u32,
+    pub mac: [u8; 6],
+    pub ip: Option<[u8; 4]>,
+    pub prefix: u8,
+    pub gateway: Option<[u8; 4]>,
+    pub dhcp: DhcpState,
+    pub dhcp_elapsed_s: u64,
+    pub clients: usize,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+}
+
 /// The network card, whichever driver it uses.
 pub enum Nic {
     Intel(E1000),
@@ -275,5 +300,44 @@ fn serve_mpd(net: &mut Net) {
         if !sock.may_recv() && sock.may_send() && client.out.is_empty() {
             sock.close(); // peer closed its side
         }
+    }
+}
+
+pub fn status() -> NetStatus {
+    let nic_id = *NIC_ID.lock();
+    let guard = NET.lock();
+    match guard.as_ref() {
+        Some(net) => NetStatus {
+            nic_id,
+            details: net.nic.details(),
+            driver: true,
+            link_up: net.nic.link_up(),
+            speed: net.nic.speed(),
+            mac: net.nic.mac(),
+            ip: net.ip.map(|c| c.address().octets()),
+            prefix: net.ip.map(|c| c.prefix_len()).unwrap_or(0),
+            gateway: net.gateway.map(|g| g.octets()),
+            dhcp: if net.ip.is_some() { DhcpState::Bound } else { DhcpState::Searching },
+            dhcp_elapsed_s: (crate::interrupts::now_ms() - net.dhcp_since_ms) / 1000,
+            clients: net.clients.iter().filter(|c| c.is_some()).count(),
+            rx_packets: net.nic.packets().0,
+            tx_packets: net.nic.packets().1,
+        },
+        None => NetStatus {
+            nic_id,
+            details: alloc::string::String::new(),
+            driver: false,
+            link_up: false,
+            speed: 0,
+            mac: [0; 6],
+            ip: None,
+            prefix: 0,
+            gateway: None,
+            dhcp: DhcpState::Searching,
+            dhcp_elapsed_s: 0,
+            clients: 0,
+            rx_packets: 0,
+            tx_packets: 0,
+        },
     }
 }
