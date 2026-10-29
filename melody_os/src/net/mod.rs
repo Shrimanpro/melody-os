@@ -262,6 +262,7 @@ fn serve_mpd(net: &mut Net) {
                 client.feed(&buf[..n], player);
             }
         }
+        client.check_idle(player);
 
         if !client.out.is_empty() && sock.can_send() {
             if let Ok(n) = sock.send_slice(&client.out) {

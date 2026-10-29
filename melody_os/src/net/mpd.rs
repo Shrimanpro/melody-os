@@ -18,6 +18,7 @@ pub struct Client {
     line: Vec<u8>,
     pub out: Vec<u8>,
     list: Option<CommandList>,
+    idle: Option<u32>, // player version seen when `idle` started
     pub close: bool,
 }
 
@@ -28,7 +29,7 @@ struct CommandList {
 
 impl Client {
     pub fn new() -> Self {
-        let mut c = Client { line: Vec::new(), out: Vec::new(), list: None, close: false };
+        let mut c = Client { line: Vec::new(), out: Vec::new(), list: None, idle: None, close: false };
         c.out.extend_from_slice(GREETING);
         c
     }
@@ -46,7 +47,27 @@ impl Client {
         }
     }
 
+    /// Called every poll: completes a pending `idle` once something changed.
+    pub fn check_idle(&mut self, player: &Player) {
+        if let Some(seen) = self.idle {
+            if player.version != seen {
+                self.idle = None;
+                self.out.extend_from_slice(b"changed: player\nchanged: mixer\nchanged: output\nOK\n");
+            }
+        }
+    }
+
     fn handle_line(&mut self, line: String, player: &mut Player) {
+        if self.idle.is_some() {
+            // While idle only `noidle` is allowed.
+            if line.trim() == "noidle" {
+                self.idle = None;
+                self.out.extend_from_slice(b"OK\n");
+            } else {
+                self.close = true;
+            }
+            return;
+        }
         if let Some(list) = self.list.as_mut() {
             if line.trim() == "command_list_end" {
                 let list = self.list.take().unwrap();
@@ -77,7 +98,7 @@ impl Client {
                 let mut resp = String::new();
                 match execute(&line, player, &mut resp, self) {
                     Ok(()) => {
-                        if !self.close {
+                        if self.idle.is_none() && !self.close {
                             self.out.extend_from_slice(resp.as_bytes());
                             self.out.extend_from_slice(b"OK\n");
                         }
@@ -173,6 +194,8 @@ fn execute(line: &str, player: &mut Player, out: &mut String, client: &mut Clien
         "ping" | "clearerror" | "binarylimit" | "random" | "single" | "consume" | "crossfade"
         | "replay_gain_mode" | "subscribe" | "unsubscribe" | "password" | "clear" => {}
         "close" => client.close = true,
+        "idle" => client.idle = Some(player.version),
+        "noidle" => {}
         "status" => {
             let s = player.status();
             let _ = write!(
@@ -270,13 +293,33 @@ fn execute(line: &str, player: &mut Player, out: &mut String, client: &mut Clien
         }
         // Exactly one output is active at a time; disabling it is a no-op.
         "disableoutput" => {}
+        "add" | "addid" => {
+            let uri = args.get(1).ok_or((ACK_ARG, "need a URI"))?;
+            let idx = player.tracks().iter().position(|t| &t.path == uri).ok_or((ACK_NO_EXIST, "No such song"))?;
+            if cmd == "addid" {
+                let _ = write!(out, "Id: {}\n", idx);
+            }
+        }
+        "lsinfo" | "listall" | "listallinfo" => {
+            let prefix = args.get(1).map(|s| s.trim_matches('/')).unwrap_or("");
+            let recursive = cmd != "lsinfo";
+            list_dir(out, player, prefix, recursive);
+        }
+        "list" => {
+            // Only "list file" style queries are meaningful without tags.
+            if args.get(1).map(|s| s.eq_ignore_ascii_case("file")).unwrap_or(false) {
+                for t in player.tracks() {
+                    let _ = write!(out, "file: {}\n", t.path);
+                }
+            }
+        }
         "stats" => {
             let _ = write!(out, "artists: 0\nalbums: 0\nsongs: {}\nuptime: {}\nplaytime: 0\ndb_playtime: 0\n", count, crate::interrupts::now_ms() / 1000);
         }
         "commands" => {
             for c in [
-                "clear", "clearerror", "close", "commands", "currentsong", "disableoutput", "enableoutput",
-                "getvol", "next", "notcommands", "outputs",
+                "add", "addid", "clear", "clearerror", "close", "commands", "currentsong", "disableoutput", "enableoutput",
+                "getvol", "idle", "list", "listall", "listallinfo", "lsinfo", "next", "noidle", "notcommands", "outputs",
                 "pause", "ping", "play", "playid", "playlistid", "playlistinfo", "previous", "repeat", "setvol", "stats",
                 "status", "stop", "tagtypes", "toggleoutput", "urlhandlers", "volume",
             ] {
@@ -293,6 +336,35 @@ fn execute(line: &str, player: &mut Player, out: &mut String, client: &mut Clien
         _ => return Err((ACK_UNKNOWN, "unknown command")),
     }
     Ok(())
+}
+
+fn list_dir(out: &mut String, player: &Player, prefix: &str, recursive: bool) {
+    let mut dirs: Vec<&str> = Vec::new();
+    for (i, t) in player.tracks().iter().enumerate() {
+        let rest = if prefix.is_empty() {
+            t.path.as_str()
+        } else if let Some(r) = t.path.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) {
+            r
+        } else {
+            continue;
+        };
+        match rest.find('/') {
+            Some(slash) if !recursive => {
+                let dir = &t.path[..t.path.len() - rest.len() + slash];
+                if dirs.last() != Some(&dir) {
+                    dirs.push(dir);
+                    let _ = write!(out, "directory: {}\n", dir);
+                }
+            }
+            _ => {
+                if recursive {
+                    let _ = write!(out, "file: {}\n", t.path);
+                } else {
+                    song_info(out, player, i);
+                }
+            }
+        }
+    }
 }
 
 #[test_case]
