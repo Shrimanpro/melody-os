@@ -61,3 +61,14 @@ fn command_lists_and_volume() {
     let resp = exchange(&mut client, &mut player, "setvol 200\n");
     assert!(resp.starts_with("ACK [2@0]"));
 }
+
+#[test_case]
+fn idle_wakes_on_change() {
+    let mut player = Player::new(Vec::new(), None);
+    let mut client = Client::new();
+    assert_eq!(exchange(&mut client, &mut player, "idle\n"), "");
+    player.set_volume(10);
+    client.check_idle(&player);
+    let resp = String::from_utf8(core::mem::take(&mut client.out)).unwrap();
+    assert!(resp.contains("changed: mixer") && resp.ends_with("OK\n"));
+}
