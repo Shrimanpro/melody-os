@@ -1,9 +1,9 @@
 [package]
 name = "melody_os"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Melody OS Developers"]
-description = "Lightweight Audiophile Rust Kernel with Intel HDA, S/PDIF, SATA AHCI, and MPD streaming"
+description = "Bare-metal jukebox kernel: USB FAT32 music library, Intel HDA output, MPD over Ethernet"
 
 [[test]]
 name = "should_panic"
@@ -40,7 +40,7 @@ features = ["spin_no_std"]
 
 [[bin]]
 name = "melody_os"
-test = true
+test = false
 bench = false
 
 [package.metadata.bootimage]
@@ -53,3 +53,4 @@ test-args = [
     "none",
 ]
 test-success-exit-code = 33 # (0x10 << 1) | 1
+test-timeout = 120
