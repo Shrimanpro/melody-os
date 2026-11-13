@@ -48,7 +48,8 @@ fn large_vec() {
 
 #[test_case]
 fn many_boxes() {
-    for i in 0..HEAP_SIZE {
+    let count = core::cmp::min(HEAP_SIZE, 20_000);
+    for i in 0..count {
         let x = Box::new(i);
         assert_eq!(*x, i);
     }

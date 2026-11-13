@@ -8,34 +8,125 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-pub mod ahci;
 pub mod allocator;
 pub mod audio;
 pub mod fs;
 pub mod gdt;
+pub mod gpu;
 pub mod interrupts;
+pub mod keyboard;
 pub mod memory;
 pub mod net;
 pub mod pci;
 pub mod serial;
+pub mod ui;
+pub mod usb;
 pub mod vga_buffer;
+
+/// Set once we've seen the PIT tick; only then is it safe to `hlt` in the main loop.
+static TIMER_WORKS: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
-    unsafe { interrupts::PICS.lock().initialize() };
+    interrupts::flush_ps2_buffer();
+    interrupts::calibrate_tsc();
+    unsafe {
+        let mut pics = interrupts::PICS.lock();
+        pics.initialize();
+        // Only IRQ 0 (timer) and IRQ 1 (keyboard). Everything else is polled.
+        pics.write_masks(0xFC, 0xFF);
+    }
+    interrupts::init_pit();
     x86_64::instructions::interrupts::enable();
+
+    let start = interrupts::TIMER_TICKS.load(Ordering::Relaxed);
+    interrupts::delay_ms(20);
+    TIMER_WORKS.store(interrupts::TIMER_TICKS.load(Ordering::Relaxed) > start, Ordering::Relaxed);
 }
+
+pub fn timer_works() -> bool {
+    TIMER_WORKS.load(Ordering::Relaxed)
+}
+
+/// Read one byte from COM1 if the terminal typed something.
+fn poll_serial_byte() -> Option<u8> {
+    use x86_64::instructions::port::Port;
+    unsafe {
+        if Port::<u8>::new(0x3FD).read() & 0x01 != 0 {
+            Some(Port::<u8>::new(0x3F8).read())
+        } else {
+            None
+        }
+    }
+}
+
+/// The one and only main loop: input, audio, network and screen, in turn, forever.
+pub fn run() -> ! {
+    use audio::player::PLAYER;
+    use keyboard::{Key, Ps2Decoder, SerialDecoder};
+
+    let mut ps2 = Ps2Decoder::new();
+    let mut serial = SerialDecoder::new();
+    let serial_present = serial::is_present();
+    let mut keys: alloc::vec::Vec<Key> = alloc::vec::Vec::with_capacity(16);
+
+    loop {
+        keys.clear();
+        while let Some(code) = interrupts::pop_scancode() {
+            keys.extend(ps2.feed(code));
+        }
+        if serial_present {
+            while let Some(b) = poll_serial_byte() {
+                keys.extend(serial.feed(b));
+            }
+        }
+        usb::poll_usb_keyboards(|k| keys.push(k));
+
+        {
+            let mut guard = PLAYER.lock();
+            if let Some(player) = guard.as_mut() {
+                for &k in &keys {
+                    ui::handle_key(k, player);
+                }
+                player.poll();
+            }
+        }
+
+        net::poll();
+
+        {
+            let mut guard = PLAYER.lock();
+            if let Some(player) = guard.as_mut() {
+                player.poll();
+                ui::render(player);
+            }
+        }
+
+        if timer_works() {
+            // Sleep until the next interrupt (at most 1 ms with the 1 kHz PIT).
+            x86_64::instructions::hlt();
+        }
+    }
+}
+
+pub fn hlt_loop() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test harness
+// ---------------------------------------------------------------------------
 
 pub trait Testable {
-    fn run(&self) -> ();
+    fn run(&self);
 }
 
-impl<T> Testable for T
-where
-    T: Fn(),
-{
+impl<T: Fn()> Testable for T {
     fn run(&self) {
         serial_print!("{}...\t", core::any::type_name::<T>());
         self();
@@ -67,23 +158,26 @@ pub enum QemuExitCode {
 
 pub fn exit_qemu(exit_code: QemuExitCode) {
     use x86_64::instructions::port::Port;
-
-    unsafe {
-        let mut port = Port::new(0xf4);
-        port.write(exit_code as u32);
-    }
+    unsafe { Port::new(0xf4).write(exit_code as u32) };
 }
 
-pub fn hlt_loop() -> ! {
-    loop {
-        x86_64::instructions::hlt();
-    }
+/// Initialise CPU tables, memory and the heap (shared by the kernel and test binaries).
+pub fn init_with_memory(boot_info: &'static bootloader::BootInfo) {
+    use x86_64::VirtAddr;
+    init();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    memory::register_frame_allocator(frame_allocator);
 }
 
 #[cfg(test)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    init();
+bootloader::entry_point!(test_kernel_main);
+
+#[cfg(test)]
+fn test_kernel_main(boot_info: &'static bootloader::BootInfo) -> ! {
+    init_with_memory(boot_info);
     test_main();
     hlt_loop();
 }

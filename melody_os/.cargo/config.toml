@@ -1,13 +1,6 @@
 [build]
 target = "x86_64-melody.json"
 
-[target.aarch64-unknown-none]
-rustflags = [
-    "-C", "link-arg=-Tlinker.ld",
-]
-[target.x86_64-unknown-none]
-runner = "bootimage runner"
-
 [target.'cfg(target_os = "none")']
 runner = "bootimage runner"
 
@@ -15,4 +8,3 @@ runner = "bootimage runner"
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 json-target-spec = true
-# runner = "qemu-system-aarch64 -M raspi3b -serial stdio -display none -kernel"
